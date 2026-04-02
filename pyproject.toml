@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-atc-optimization"
+version = "1.0.0"
+description = "OpenEnv benchmark for realistic air traffic control disruption recovery"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.128.0",
+    "openai>=2.30.0",
+    "openenv-core[core]>=0.2.3",
+    "pydantic>=2.12.0",
+    "uvicorn>=0.41.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "requests>=2.33.0",
+]
+
+[project.scripts]
+server = "atc_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["atc_env", "atc_env.server"]
+package-dir = { "atc_env" = ".", "atc_env.server" = "server" }
