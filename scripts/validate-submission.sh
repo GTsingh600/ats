@@ -103,7 +103,20 @@ log "Repo:     $REPO_DIR"
 log "Ping URL: $PING_URL"
 printf "\n"
 
-log "${BOLD}Step 1/3: Pinging HF Space${NC} ($PING_URL/reset) ..."
+log "${BOLD}Step 0/4: Checking release branch hygiene${NC} ..."
+if [ -x "$REPO_DIR/scripts/check_release_hygiene.sh" ]; then
+  if "$REPO_DIR/scripts/check_release_hygiene.sh" "$REPO_DIR" >/dev/null; then
+    pass "Release hygiene check passed"
+  else
+    fail "Release hygiene check failed"
+    stop_at "Step 0"
+  fi
+else
+  fail "scripts/check_release_hygiene.sh not found or not executable"
+  stop_at "Step 0"
+fi
+
+log "${BOLD}Step 1/4: Pinging HF Space${NC} ($PING_URL/reset) ..."
 
 CURL_OUTPUT=$(portable_mktemp "validate-curl")
 CLEANUP_FILES+=("$CURL_OUTPUT")
@@ -125,7 +138,7 @@ else
   stop_at "Step 1"
 fi
 
-log "${BOLD}Step 2/3: Running docker build${NC} ..."
+log "${BOLD}Step 2/4: Running docker build${NC} ..."
 
 if ! command -v docker &>/dev/null; then
   fail "docker command not found"
@@ -155,7 +168,7 @@ else
   stop_at "Step 2"
 fi
 
-log "${BOLD}Step 3/3: Running openenv validate${NC} ..."
+log "${BOLD}Step 3/4: Running openenv validate${NC} ..."
 
 if ! command -v openenv &>/dev/null; then
   fail "openenv command not found"
@@ -177,7 +190,7 @@ fi
 
 printf "\n"
 printf "${BOLD}========================================${NC}\n"
-printf "${GREEN}${BOLD}  All 3/3 checks passed!${NC}\n"
+printf "${GREEN}${BOLD}  All 4/4 checks passed!${NC}\n"
 printf "${GREEN}${BOLD}  Your submission is ready to submit.${NC}\n"
 printf "${BOLD}========================================${NC}\n"
 printf "\n"
