@@ -110,13 +110,23 @@ To avoid gaming the benchmark with tiny partial plans, the operational score is 
 
 [inference.py](inference.py) is the required root-level inference script. It:
 
-- uses the OpenAI Python client for LLM calls
-- reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`
+- supports both **Groq API** (Llama 3.1 8B) and OpenAI-compatible endpoints
+- reads `GROQ_API_KEY` for Groq inference, or `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` for HuggingFace
 - emits strict `[START]`, `[STEP]`, and `[END]` logs
 - runs all three tasks
-- falls back to a deterministic planner from [planner.py](/workspace/planner.py) if model output fails
+- falls back to a deterministic planner from [planner.py](planner.py) if model output fails
 
 The deterministic planner is useful for reproducibility and CI smoke tests. When a model endpoint is configured, the LLM gets the task briefing and a heuristic seed plan and is asked to return strict JSON.
+
+### Running with Groq API (Llama 3.1 8B)
+
+```bash
+export GROQ_API_KEY="your-groq-api-key"
+python test_groq_inference.py  # Test the setup
+python -m inference            # Run full inference
+```
+
+See [GROQ_SETUP.md](GROQ_SETUP.md) for detailed configuration and troubleshooting.
 
 ### Reproducible baseline scores
 
@@ -154,9 +164,26 @@ pip install uv
 uv sync
 ```
 
-### Required environment variables
+### Environment variables - Option 1: Groq API (Recommended)
 
-Before running `inference.py`, define:
+For fast inference with Llama 3.1 8B:
+
+```bash
+export GROQ_API_KEY="your-groq-api-key"
+export GROQ_MODEL="llama-3.1-8b-instant"  # optional, defaults to this
+```
+
+Then run:
+```bash
+python test_groq_inference.py  # verify setup
+python -m inference            # run full benchmark
+```
+
+See [GROQ_SETUP.md](GROQ_SETUP.md) for detailed guide.
+
+### Environment variables - Option 2: HuggingFace API
+
+For OpenAI-compatible endpoints:
 
 ```bash
 export API_BASE_URL="https://your-llm-endpoint/v1"
@@ -164,9 +191,14 @@ export MODEL_NAME="your-model-name"
 export HF_TOKEN="your-secret-token"
 ```
 
-`OPENAI_API_KEY` is also accepted as a credential fallback when `HF_TOKEN` is not set.
+### Testing without LLM
 
-For local testing without an LLM endpoint, the script still runs by falling back to the deterministic planner.
+For local testing without an LLM endpoint, the script still runs by falling back to the deterministic planner:
+
+```bash
+python -m inference  # Uses heuristic baseline only
+```
+
 
 ## Running the environment
 
