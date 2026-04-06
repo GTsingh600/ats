@@ -9,163 +9,133 @@ tags:
 
 # ATC Optimization OpenEnv
 
-This repository implements a realistic OpenEnv benchmark for air traffic control disruption recovery. The agent acts like a tactical tower/flow controller who must re-sequence arrivals and departures after weather, runway inspection, or irregular-operations events. The benchmark ships with typed OpenEnv models, `/reset`, `/step`, and `/state` endpoints, a strict `openenv.yaml`, three graded tasks from easy to hard, a reproducible baseline `inference.py`, and Docker/Hugging Face Spaces deployment assets.
+A real-world OpenEnv benchmark for **air traffic disruption recovery**. The agent acts as a tactical ATC/flow controller and must build safe, complete runway slot plans under operational pressure (weather, inspections, emergency priorities, bank balancing).
 
-## Why this is a real-world task
+## Judge Quick View
 
-This is not a toy routing problem. Each episode models the kind of tactical optimization controllers and airline operations centers actually face:
+- Real-world domain: ATC disruption recovery (not a game)
+- OpenEnv API: typed models + `/reset`, `/step`, `/state`
+- Tasks: 3 deterministic graded tasks (`easy`, `medium`, `hard`)
+- Graders: bounded `0.0-1.0`, deterministic composite score
+- Baseline: root-level `inference.py`, structured `[START]/[STEP]/[END]` logs
+- Infra: Dockerfile + HF Space deployment flow
 
-- runway assignment under reduced capacity
-- wake-turbulence spacing constraints
-- emergency or medical prioritization
-- connection-bank protection
-- fairness across airlines during disruption
-- fuel burn and passenger delay tradeoffs
+## Requirement-to-Evidence Matrix
 
-The agent must produce a full slot plan, not just rank flights. Plans are graded on safety, completeness, priority handling, delay efficiency, fairness, and fuel efficiency.
+| Requirement | Evidence |
+|---|---|
+| Real-world utility | `tasks.py` models real ATC disruption scenarios with safety and fairness constraints |
+| Full OpenEnv spec | `openenv.yaml`, typed Pydantic models in `models.py`, server endpoints in `server/app.py` |
+| 3+ tasks with graders | `delhi_monsoon_recovery_easy`, `mumbai_bank_balance_medium`, `bengaluru_irrops_hard` in `tasks.py`; grading in `graders.py` |
+| Meaningful reward shaping | Dense step-wise reward with partial progress in `engine.py` |
+| Reproducible baseline | Root `inference.py` with deterministic fallback + strict stdout format |
+| Docker + Space deployability | `Dockerfile`, `scripts/deploy_hf_space.py`, `scripts/validate-submission.sh` |
+| Validation workflow | `python -m openenv.cli validate .`, `python scripts/run_graders.py`, `python inference.py` |
 
-## OpenEnv compliance
+## Environment Design
 
-The environment is spec-compliant for the current OpenEnv validator:
+### Action Space
+`ATCOptimizationAction` in `models.py`
 
-- `openenv.yaml` is in the repo root
-- typed Pydantic models are defined in [models.py](models.py)
-- FastAPI entrypoint is [server/app.py](server/app.py)
-- environment logic is in [server/atc_environment.py](server/atc_environment.py)
-- package metadata and `server` script are defined in [pyproject.toml](pyproject.toml)
-- `uv.lock` is generated for reproducible builds
+- `proposal`: list of `SlotAssignment`
+- `rationale`: reasoning summary
+- `commit`: finish episode flag
 
-`python -m openenv.cli validate .` is expected to report `[OK] : Ready for multi-mode deployment`.
-
-## Tasks
-
-Three benchmark tasks are included in [tasks.py](tasks.py):
-
-1. `delhi_monsoon_recovery_easy`
-   Weather-reduced departure recovery with one medical flight.
-2. `mumbai_bank_balance_medium`
-   Mixed arrival/departure bank balancing with fairness pressure.
-3. `bengaluru_irrops_hard`
-   Irregular operations scenario with an emergency arrival, a medical departure, and severe bank congestion.
-
-Each task is scored by:
-
-- the simulator in [engine.py](engine.py)
-- a deterministic supervisor grader
-- a deterministic audit grader
-- an official deterministic composite grader in [graders.py](graders.py)
-- an optional LLM supervisor grader for supplemental analysis only
-
-All grader outputs are clamped to `0.0-1.0`.
-
-## Action space
-
-The action model is [ATCOptimizationAction](models.py):
-
-- `proposal`: list of typed `SlotAssignment` items
-- `rationale`: short explanation of the sequencing logic
-- `commit`: whether to end the episode after the current plan
-
-Each `SlotAssignment` contains:
+Each `SlotAssignment` includes:
 
 - `flight_id`
 - `runway`
 - `assigned_minute`
 - `hold_minutes`
 
-This makes the task easy for both programmatic agents and LLM planners: propose a full schedule in structured JSON, send it once, get dense operational feedback back.
+### Observation Space
+`ATCOptimizationObservation` in `models.py`
 
-## Observation space
-
-The observation model is [ATCOptimizationObservation](models.py). It includes:
-
-- scenario identity and difficulty
-- full flight list and runway list
-- text briefing for prompt-based agents
-- current metrics and best metrics
+- task metadata and briefing
+- flight and runway state
+- current and best metrics
 - diagnostics and recommendations
 - grader feedback
 - `steps_remaining`
 
-State inspection is available through [ATCOptimizationState](models.py) and exposed by `/state`.
-The state payload includes `active_task_ids` so validators and agents can enumerate all configured tasks.
+### State Space
+`ATCOptimizationState` exposed by `/state`
 
-## Reward design
+- includes `active_task_ids` so tasks are enumerable by validators/agents
 
-Reward is dense and gives partial progress signals:
+## Tasks and Difficulty
 
-- every submitted plan is simulated and graded
-- step reward is the improvement over the previous best plan
-- the first submitted plan receives its full score as reward
-- later steps can improve the best-known plan and earn incremental reward
-- incomplete plans, invalid assignments, runway conflicts, and priority misses sharply reduce score
+Defined in `tasks.py`:
 
-The simulator score uses:
+1. `delhi_monsoon_recovery_easy` (easy)
+2. `mumbai_bank_balance_medium` (medium)
+3. `bengaluru_irrops_hard` (hard)
 
-- schedule completeness
+All tasks are scored with deterministic and bounded outputs (`0.0-1.0`).
+
+## Reward and Scoring
+
+Operational score components in `engine.py`:
+
+- completeness
 - conflict-free ratio
 - priority handling
 - delay efficiency
 - fairness
 - fuel efficiency
 
-To avoid gaming the benchmark with tiny partial plans, the operational score is multiplied by completeness and additionally penalized when conflicts remain.
+Reward behavior:
 
-The official benchmark score is now fully deterministic. The optional LLM grader is preserved as a side-channel supervisor signal, but it no longer changes the submission score.
+- first valid submission receives full score
+- next steps receive incremental improvement reward
+- invalid/incomplete/conflicting plans are penalized
 
-## Baseline inference
+Official submission score is deterministic composite grading (`graders.py`).
 
-[inference.py](inference.py) is the required root-level inference script. It:
+## Baseline Inference (Submission Script)
 
-- uses the OpenAI Python client for LLM calls
-- reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`
-- emits strict `[START]`, `[STEP]`, and `[END]` logs
-- runs all three tasks
-- uses a two-step deterministic planning loop from [planner.py](planner.py)
-- falls back to the deterministic planner if model output fails
+Root file: `inference.py`
 
-The deterministic baseline now submits a safe seed plan first and then submits a refined plan on the next step. That makes the reward shaping visible in the logs and gives the hard task a more realistic revise-and-improve trajectory. When a model endpoint is configured, the LLM gets the task briefing, metrics, diagnostics, and a deterministic seed plan and is asked to return strict JSON.
+- uses OpenAI client interface
+- reads `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`
+- emits strict structured logs:
+  - `[START]`
+  - `[STEP]`
+  - `[END]`
+- deterministic fallback when model output is unavailable/invalid
 
-### Reproducible baseline scores
-
-With no LLM credentials configured, `inference.py` falls back to the deterministic two-step planner and currently produces these final composite scores:
+### Baseline Scores (Deterministic Fallback)
 
 - `delhi_monsoon_recovery_easy`: `0.98`
 - `mumbai_bank_balance_medium`: `0.98`
 - `bengaluru_irrops_hard`: `0.94`
 
-The script emits only the required `[START]`, `[STEP]`, and `[END]` stdout records, with rewards and final score formatted for validator compatibility.
+## Repository Layout
 
-## File guide
-
-- [models.py](models.py): typed OpenEnv action, observation, state, task, and grading models
-- [tasks.py](tasks.py): the easy, medium, and hard benchmark scenarios
-- [engine.py](engine.py): ATC simulator, safety checks, and reward shaping
-- [graders.py](graders.py): deterministic official graders plus optional LLM-side analysis
-- [planner.py](planner.py): deterministic seed planner plus local refinement search
-- [client.py](client.py): typed OpenEnv client
-- [server/atc_environment.py](server/atc_environment.py): environment implementation
-- [server/app.py](server/app.py): FastAPI/OpenEnv server entrypoint
-- [inference.py](inference.py): submission-time baseline runner
-- [Dockerfile](Dockerfile): container build for HF Spaces and validator docker builds
-- [scripts/run_graders.py](scripts/run_graders.py): enumerate tasks and verify grader score ranges
-- [scripts/validate-submission.sh](scripts/validate-submission.sh): competition-style validator for Space reachability, Docker build, and `openenv validate`
-- [scripts/ping_env.py](scripts/ping_env.py): ping a local or deployed environment and test `/reset`
-- [scripts/run_local_checklist.ps1](scripts/run_local_checklist.ps1): one-command local validation runner for Windows/PowerShell
-- [scripts/pre_submission_validate.sh](scripts/pre_submission_validate.sh): convenience wrapper for the checklist
+- `models.py`: typed contracts
+- `tasks.py`: scenario catalog
+- `engine.py`: simulation + reward shaping
+- `graders.py`: deterministic graders + optional LLM side-channel
+- `planner.py`: deterministic baseline planner
+- `server/atc_environment.py`: environment implementation
+- `server/app.py`: FastAPI/OpenEnv entrypoint
+- `inference.py`: required baseline script (root)
+- `openenv.yaml`: environment metadata
+- `Dockerfile`: container runtime
+- `scripts/run_graders.py`: task grading check
+- `scripts/ping_env.py`: deployment health/reset ping
+- `scripts/validate-submission.sh`: judge-style validator
+- `scripts/pre_submission_validate.sh`: convenience wrapper
+- `scripts/deploy_hf_space.py`: HF API deployment helper
 
 ## Setup
-
-### Local Python setup
 
 ```bash
 pip install uv
 uv sync
 ```
 
-### Required environment variables
-
-Before running `inference.py`, define:
+## Required Environment Variables
 
 ```bash
 export API_BASE_URL="https://your-llm-endpoint/v1"
@@ -173,142 +143,104 @@ export MODEL_NAME="your-model-name"
 export HF_TOKEN="your-secret-token"
 ```
 
-`OPENAI_API_KEY` is intentionally not used in release inference to keep benchmark configuration deterministic.
+Note: use `python -m inference` (module) or `python inference.py` (script), not `python -m inference.py`.
 
-### Testing without LLM
+## Local Runbook
 
-For local testing without an LLM endpoint, the script still runs by falling back to the deterministic planner:
-
-```bash
-python -m inference  # Uses heuristic baseline only
-```
-
-Use `python -m inference` (module name only), not `python -m inference.py`.
-
-
-## Running the environment
-
-### Start the server
+Start server:
 
 ```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### Validate the OpenEnv package
+Run OpenEnv validation:
 
 ```bash
 python -m openenv.cli validate .
 ```
 
-### Run the baseline inference
-
-```bash
-python inference.py
-```
-
-### Run graders across all tasks
+Run all graders:
 
 ```bash
 python scripts/run_graders.py
 ```
 
-### Run the full local checklist on Windows
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_local_checklist.ps1
-```
-
-## Hugging Face Spaces deployment
-
-This repo is ready for a Docker Space:
-
-1. Create a new Hugging Face Space with SDK = `Docker`.
-2. Push this repository contents to the Space.
-3. Add `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` as Space secrets if you want the LLM-backed grader and inference improvements enabled.
-4. After deploy, verify:
+Run baseline inference:
 
 ```bash
-python scripts/ping_env.py https://<your-space>.hf.space
+python inference.py
 ```
 
-The Space should return `200` on `/health` and respond to `/reset`.
-
-### Deploy with Hugging Face API
-
-You can deploy/update the Space directly with the API helper:
+Run tests:
 
 ```bash
-export HF_TOKEN="hf_xxx"
-export HF_SPACE_ID="<your-username>/<your-space-name>"
-python scripts/deploy_hf_space.py --space-id "$HF_SPACE_ID" --repo-dir .
+uv run pytest -q
 ```
-
-Then validate against the live Space URL:
-
-```bash
-./scripts/validate-submission.sh "https://<your-username>-<your-space-name>.hf.space" .
-```
-
-If you want a token-only setup, start from [.env.hf_space.example](.env.hf_space.example), which already includes the Space id/url and runtime defaults.
 
 ## Docker
 
-Build locally:
+Build:
 
 ```bash
 docker build .
 ```
 
-Run locally:
+Run:
 
 ```bash
 docker run --rm -p 8000:8000 atc-openenv
 ```
 
-## Pre-submission checklist
+## Hugging Face Space Deployment
 
-These commands cover the expected checks:
+### Option A: Manual
+
+1. Create HF Space with SDK = Docker
+2. Push repository
+3. Set secrets: `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`
+4. Ping deployment:
+
+```bash
+python scripts/ping_env.py https://<your-space>.hf.space
+```
+
+### Option B: HF API Helper
+
+Token-only template is provided in `.env.hf_space.example`.
+
+```bash
+export HF_TOKEN="hf_xxx"
+export HF_SPACE_ID="<owner>/<space-name>"
+python scripts/deploy_hf_space.py --space-id "$HF_SPACE_ID" --repo-dir .
+```
+
+Then validate:
+
+```bash
+./scripts/validate-submission.sh "https://<owner>-<space-name>.hf.space" .
+```
+
+## Pre-Submission Checklist
+
+Run all before final submission:
 
 ```bash
 python -m openenv.cli validate .
+uv run pytest -q
 python scripts/run_graders.py
 python inference.py
-docker build .
+./scripts/validate-submission.sh https://<your-space>.hf.space .
 ```
 
-If you also have a deployed Space URL:
+Expected:
 
-```bash
-bash scripts/validate-submission.sh https://<your-space>.hf.space .
-```
+- OpenEnv validate: `[OK] : Ready for multi-mode deployment`
+- Grader scores bounded `0.0-1.0`
+- Inference logs strictly follow `[START]/[STEP]/[END]`
+- Space responds to `/health` and `/reset`
 
-Legacy wrapper:
+## Notes for Judges
 
-```bash
-bash scripts/pre_submission_validate.sh https://<your-space>.hf.space .
-```
-
-## Work to be done before submission
-
-The environment is code-complete and locally validated, but the following submission checks still need to be completed on deployment infrastructure:
-
-- verify `docker build .` on a machine with Docker Engine running
-- deploy the repository to a public Hugging Face Docker Space
-- confirm the live Space responds with `200` on `/health` and `/reset`
-- run `scripts/pre_submission_validate.sh` against the deployed Space URL
-- record the final public repository URL and Space URL in the submission form
-
-These are deployment and publication tasks rather than environment logic gaps.
-
-## Concepts behind the code
-
-The benchmark separates concerns deliberately:
-
-- data contracts live in typed Pydantic models
-- scenario content lives in the task catalog
-- operations logic lives in the simulator
-- reward shaping and grading stay explicit and inspectable
-- the baseline planner is deterministic so scores can be reproduced
-- the LLM layer is optional and isolated to inference and the optional supervisor grader
-
-That structure makes it easy to extend the benchmark with new airports, new disruption types, or richer planners without breaking the OpenEnv contract.
+- Deterministic scoring is intentional for reproducibility and anti-gaming.
+- Optional LLM signals are preserved as auxiliary analysis, not official score drivers.
+- Release branch is hackathon-standard focused; Groq-only development artifacts are excluded.
