@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import httpx
+from groq import Groq
 from openai import OpenAI
 
 ROOT = Path(__file__).resolve().parent
@@ -23,15 +24,32 @@ from models import ATCOptimizationAction
 from planner import build_heuristic_plan
 
 
+# Groq API configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# Fallback to HuggingFace if Groq key not available
+HF_TOKEN = os.getenv("HF_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
+
+# Determine which provider to use
+if GROQ_API_KEY:
+    # Use Groq API
+    API_KEY = GROQ_API_KEY
+    API_PROVIDER = "groq"
+    ACTIVE_MODEL = GROQ_MODEL
+elif HF_TOKEN:
+    # Use HuggingFace API
+    API_KEY = HF_TOKEN
+    API_PROVIDER = "huggingface"
+    ACTIVE_MODEL = MODEL_NAME
+else:
     raise ValueError(
-        "HF_TOKEN environment variable is required. "
-        "Set it to your Hugging Face API token."
+        "Either GROQ_API_KEY or HF_TOKEN environment variable is required. "
+        "For Groq: export GROQ_API_KEY='your-key-here'\n"
+        "For HuggingFace: export HF_TOKEN='your-token-here'"
     )
-API_KEY = HF_TOKEN
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", os.getenv("IMAGE_NAME", ""))
 BENCHMARK = "atc_optimization_openenv"
 TASK_IDS = [
@@ -114,7 +132,7 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
         [item.model_dump() for item in heuristic_plan],
         ensure_ascii=True,
     )
-    if client is None or not API_BASE_URL or not API_KEY or MODEL_NAME == "heuristic-baseline":
+    if client is None or not API_KEY or ACTIVE_MODEL == "heuristic-baseline":
         return ATCOptimizationAction(
             proposal=heuristic_plan,
             rationale="Deterministic heuristic baseline used because no model endpoint is configured.",
@@ -132,7 +150,7 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
     )
     try:
         completion = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=ACTIVE_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -183,7 +201,7 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
     steps_taken = 0
     score = 0.0
     success = False
-    runtime_model = MODEL_NAME if client is not None else "heuristic-baseline"
+    runtime_model = ACTIVE_MODEL if client is not None else "heuristic-baseline"
     log_start(task=task_id, env=BENCHMARK, model=runtime_model)
 
     async with ATCOptimizationEnv(base_url=base_url) as env:
@@ -218,7 +236,12 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
 
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_BASE_URL and API_KEY else None
+    # Initialize client based on API provider
+    if API_PROVIDER == "groq":
+        client = Groq(api_key=API_KEY)
+    else:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_BASE_URL and API_KEY else None
+    
     base_url, process = await prepare_base_url()
     try:
         for task_id in TASK_IDS:
