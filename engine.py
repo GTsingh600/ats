@@ -85,12 +85,15 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     invalid_assignments = 0
 
     assignment_map: Dict[str, SlotAssignment] = {}
+    duplicate_assignments = max(0, len(assignments) - len({item.flight_id for item in assignments}))
     for assignment in assignments:
         if assignment.flight_id in assignment_map:
             diagnostics.append(
                 f"{assignment.flight_id} appears more than once; only the last assignment is used."
             )
         assignment_map[assignment.flight_id] = assignment
+    if duplicate_assignments:
+        invalid_assignments += duplicate_assignments
 
     scheduled_by_runway: Dict[str, List[Tuple[int, SlotAssignment, FlightRecord]]] = defaultdict(list)
     delays: Dict[str, int] = {}
@@ -118,6 +121,14 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
             diagnostics.append(f"Runway {assignment.runway} is not available in this task.")
             continue
 
+        runway = runways_by_id[assignment.runway]
+        if flight.operation not in runway.allowed_operations:
+            invalid_assignments += 1
+            diagnostics.append(
+                f"Runway {assignment.runway} cannot handle {flight.operation.value} operations for {flight.flight_id}."
+            )
+            continue
+
         if assignment.assigned_minute < flight.earliest_minute or assignment.assigned_minute > flight.latest_minute:
             invalid_assignments += 1
             diagnostics.append(
@@ -126,6 +137,10 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
             continue
 
         delay = _delay_for(flight, assignment.assigned_minute)
+        if assignment.hold_minutes > 0 and abs(assignment.hold_minutes - delay) > 5:
+            diagnostics.append(
+                f"{flight.flight_id} declares hold_minutes={assignment.hold_minutes}, but the actual delay is {delay}."
+            )
         delays[flight.flight_id] = delay
         per_airline_delays[flight.airline].append(delay)
         fuel_burn += delay * flight.fuel_burn_per_minute
@@ -194,6 +209,8 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         recommendations.append("Cover every flight in the scenario before refining the sequence.")
     if conflict_count > 0:
         recommendations.append("Increase spacing on the affected runway or move some flights to a parallel runway.")
+    if duplicate_assignments > 0:
+        recommendations.append("Avoid duplicate flight entries; submit one definitive assignment per flight.")
     if priority_violations > 0:
         recommendations.append("Pull medical, emergency, and connection-sensitive flights closer to the front of the sequence.")
     if fairness < 0.7:

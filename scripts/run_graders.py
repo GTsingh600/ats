@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from engine import simulate_plan
 from graders import grade_task
 from models import ATCOptimizationObservation
-from planner import build_heuristic_plan
+from planner import build_heuristic_plan, build_refined_plan
 from tasks import ordered_tasks, render_task_briefing
 
 
@@ -33,15 +33,17 @@ def main() -> int:
             runways=task.runways,
             steps_remaining=task.max_steps,
         )
-        proposal = build_heuristic_plan(observation)
+        seed_plan = build_heuristic_plan(observation)
+        proposal = build_refined_plan(observation, seed_plan=seed_plan)
         outcome = simulate_plan(task, proposal)
-        grades = grade_task(task, outcome, proposal, "Deterministic heuristic baseline.")
+        grades = grade_task(task, outcome, proposal, "Deterministic two-step baseline.")
         for grade in grades:
             assert 0.0 <= grade.score <= 1.0, f"{grade.grader_name} out of range for {task.task_id}"
         rows.append(
             {
                 "task_id": task.task_id,
                 "difficulty": task.difficulty.value,
+                "seed_operational_score": simulate_plan(task, seed_plan).metrics.overall_score,
                 "operational_score": outcome.metrics.overall_score,
                 "grader_scores": {grade.grader_name: grade.score for grade in grades},
             }

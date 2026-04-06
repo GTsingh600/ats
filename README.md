@@ -44,14 +44,15 @@ Three benchmark tasks are included in [tasks.py](tasks.py):
 2. `mumbai_bank_balance_medium`
    Mixed arrival/departure bank balancing with fairness pressure.
 3. `bengaluru_irrops_hard`
-   Irregular operations scenario with an emergency arrival and heavy congestion.
+   Irregular operations scenario with an emergency arrival, a medical departure, and severe bank congestion.
 
 Each task is scored by:
 
-- the simulator in [engine.py](/workspace/engine.py)
+- the simulator in [engine.py](engine.py)
 - a deterministic supervisor grader
-- an optional LLM supervisor grader
-- a composite grader in [graders.py](/workspace/graders.py)
+- a deterministic audit grader
+- an official deterministic composite grader in [graders.py](graders.py)
+- an optional LLM supervisor grader for supplemental analysis only
 
 All grader outputs are clamped to `0.0-1.0`.
 
@@ -93,6 +94,7 @@ Reward is dense and gives partial progress signals:
 - every submitted plan is simulated and graded
 - step reward is the improvement over the previous best plan
 - the first submitted plan receives its full score as reward
+- later steps can improve the best-known plan and earn incremental reward
 - incomplete plans, invalid assignments, runway conflicts, and priority misses sharply reduce score
 
 The simulator score uses:
@@ -106,6 +108,8 @@ The simulator score uses:
 
 To avoid gaming the benchmark with tiny partial plans, the operational score is multiplied by completeness and additionally penalized when conflicts remain.
 
+The official benchmark score is now fully deterministic. The optional LLM grader is preserved as a side-channel supervisor signal, but it no longer changes the submission score.
+
 ## Baseline inference
 
 [inference.py](inference.py) is the required root-level inference script. It:
@@ -114,33 +118,35 @@ To avoid gaming the benchmark with tiny partial plans, the operational score is 
 - reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`
 - emits strict `[START]`, `[STEP]`, and `[END]` logs
 - runs all three tasks
-- falls back to a deterministic planner from [planner.py](/workspace/planner.py) if model output fails
+- uses a two-step deterministic planning loop from [planner.py](planner.py)
+- falls back to the deterministic planner if model output fails
 
-The deterministic planner is useful for reproducibility and CI smoke tests. When a model endpoint is configured, the LLM gets the task briefing and a heuristic seed plan and is asked to return strict JSON.
+The deterministic baseline now submits a safe seed plan first and then submits a refined plan on the next step. That makes the reward shaping visible in the logs and gives the hard task a more realistic revise-and-improve trajectory. When a model endpoint is configured, the LLM gets the task briefing, metrics, diagnostics, and a deterministic seed plan and is asked to return strict JSON.
 
 ### Reproducible baseline scores
 
-With no LLM credentials configured, `inference.py` falls back to the deterministic heuristic planner and produces these baseline composite scores:
+With no LLM credentials configured, `inference.py` falls back to the deterministic two-step planner and currently produces these final composite scores:
 
-- `delhi_monsoon_recovery_easy`: `0.9102`
-- `mumbai_bank_balance_medium`: `0.7813`
-- `bengaluru_irrops_hard`: `0.8179`
+- `delhi_monsoon_recovery_easy`: `0.98`
+- `mumbai_bank_balance_medium`: `0.98`
+- `bengaluru_irrops_hard`: `0.94`
 
-The script emits only the required `[START]`, `[STEP]`, and `[END]` stdout records, with rewards formatted to two decimal places for validator compatibility.
+The script emits only the required `[START]`, `[STEP]`, and `[END]` stdout records, with rewards and final score formatted for validator compatibility.
 
 ## File guide
 
 - [models.py](models.py): typed OpenEnv action, observation, state, task, and grading models
 - [tasks.py](tasks.py): the easy, medium, and hard benchmark scenarios
 - [engine.py](engine.py): ATC simulator, safety checks, and reward shaping
-- [graders.py](graders.py): deterministic and optional LLM supervisor graders
-- [planner.py](planner.py): deterministic baseline planner
+- [graders.py](graders.py): deterministic official graders plus optional LLM-side analysis
+- [planner.py](planner.py): deterministic seed planner plus local refinement search
 - [client.py](client.py): typed OpenEnv client
 - [server/atc_environment.py](server/atc_environment.py): environment implementation
 - [server/app.py](server/app.py): FastAPI/OpenEnv server entrypoint
 - [inference.py](inference.py): submission-time baseline runner
 - [Dockerfile](Dockerfile): container build for HF Spaces and validator docker builds
 - [scripts/run_graders.py](scripts/run_graders.py): enumerate tasks and verify grader score ranges
+- [scripts/validate-submission.sh](scripts/validate-submission.sh): competition-style validator for Space reachability, Docker build, and `openenv validate`
 - [scripts/ping_env.py](scripts/ping_env.py): ping a local or deployed environment and test `/reset`
 - [scripts/run_local_checklist.ps1](scripts/run_local_checklist.ps1): one-command local validation runner for Windows/PowerShell
 - [scripts/pre_submission_validate.sh](scripts/pre_submission_validate.sh): convenience wrapper for the checklist
@@ -241,6 +247,12 @@ docker build .
 ```
 
 If you also have a deployed Space URL:
+
+```bash
+bash scripts/validate-submission.sh https://<your-space>.hf.space .
+```
+
+Legacy wrapper:
 
 ```bash
 bash scripts/pre_submission_validate.sh https://<your-space>.hf.space .

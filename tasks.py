@@ -168,42 +168,43 @@ TASKS: List[TaskDefinition] = [
     ),
     TaskDefinition(
         task_id="bengaluru_irrops_hard",
-        title="Bengaluru Irregular Operations Command",
+        title="Bengaluru IRROPS Recovery Command",
         difficulty=Difficulty.HARD,
         airport="VOBL",
         description=(
             "A rapidly evolving irregular-operations event combines wet-runway spacing, "
-            "an emergency inbound, and a heavily peaking departure bank. The controller "
-            "must sequence mixed traffic with both safety and network impact in mind."
+            "an emergency inbound, a time-critical medical departure, and a heavily "
+            "peaking departure bank. The controller must sequence mixed traffic with "
+            "both safety and network impact in mind."
         ),
         objective=(
-            "Protect the emergency arrival, keep all assignments conflict-free under "
-            "reduced capacity, minimize system delay, and distribute unavoidable delay "
-            "fairly across the participating airlines."
+            "Protect the emergency arrival and medical departure, keep all assignments "
+            "conflict-free under reduced capacity, minimize system delay, and distribute "
+            "unavoidable delay fairly across the participating airlines."
         ),
         grading_focus=[
-            "Emergency arrival prioritized",
+            "Emergency and medical traffic prioritized",
             "Zero separation and capacity conflicts",
             "Balanced delay distribution under IRROPS",
         ],
         planning_horizon_minutes=140,
-        max_steps=5,
-        delay_budget=255,
-        fuel_budget=1840.0,
-        fairness_tolerance=10.0,
+        max_steps=6,
+        delay_budget=235,
+        fuel_budget=1760.0,
+        fairness_tolerance=8.5,
         runways=[
             RunwaySpec(
                 runway_id="09L",
                 allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
-                hourly_capacity=20,
-                weather_penalty=1.25,
+                hourly_capacity=18,
+                weather_penalty=1.3,
                 notes="Mixed-mode runway with longer heavy-to-medium spacing.",
             ),
             RunwaySpec(
                 runway_id="09R",
                 allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
-                hourly_capacity=18,
-                weather_penalty=1.2,
+                hourly_capacity=16,
+                weather_penalty=1.25,
                 notes="Secondary runway handling overflow and tactical recovery.",
             ),
         ],
@@ -220,10 +221,12 @@ TASKS: List[TaskDefinition] = [
             _f("AKJ303", "AKJ", OperationType.DEPARTURE, WakeClass.MEDIUM, 25, 25, 98, ["09L", "09R"], 178, 2.4),
             _f("AIX770", "AIX", OperationType.DEPARTURE, WakeClass.MEDIUM, 27, 27, 102, ["09R"], 164, 2.6),
             _f("IGO702", "IGO", OperationType.DEPARTURE, WakeClass.MEDIUM, 30, 30, 108, ["09L", "09R"], 192, 2.4),
+            _f("MED208", "AIC", OperationType.DEPARTURE, WakeClass.MEDIUM, 31, 31, 85, ["09R"], 154, 2.8, PriorityClass.MEDICAL, 0.4, "Time-critical organ transport departure."),
             _f("AIC605", "AIC", OperationType.ARRIVAL, WakeClass.HEAVY, 33, 33, 60, ["09L"], 244, 6.4, PriorityClass.CONNECTION, 0.7),
             _f("VTI640", "VTI", OperationType.DEPARTURE, WakeClass.MEDIUM, 36, 36, 112, ["09R"], 182, 2.5),
             _f("GOW099", "GOW", OperationType.DEPARTURE, WakeClass.MEDIUM, 39, 39, 118, ["09L", "09R"], 180, 2.2),
             _f("AKJ818", "AKJ", OperationType.ARRIVAL, WakeClass.MEDIUM, 42, 42, 68, ["09L", "09R"], 171, 5.4, PriorityClass.CONNECTION, 0.5),
+            _f("AIC990", "AIC", OperationType.ARRIVAL, WakeClass.HEAVY, 45, 45, 72, ["09L"], 246, 6.6, PriorityClass.CONNECTION, 0.8, "Second fuel-sensitive long-haul inbound wave."),
         ],
     ),
 ]
