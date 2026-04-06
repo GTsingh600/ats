@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from statistics import pstdev
 from typing import Dict, Iterable, List, Tuple
 
+# Import models with automatic relative/absolute fallback
 try:
     from .models import (
         FlightRecord,
@@ -15,6 +16,15 @@ try:
         SlotAssignment,
         TaskDefinition,
         TaskMetrics,
+    )
+    from .constants import (
+        SEPARATION_BY_WAKE,
+        SCORE_WEIGHTS,
+        METRIC_PRECISION,
+        FUEL_PRECISION,
+        AIRLINE_DELAY_PRECISION,
+        MAX_DIAGNOSTICS,
+        MAX_RECOMMENDATIONS,
     )
 except ImportError:
     from models import (
@@ -25,9 +35,7 @@ except ImportError:
         TaskDefinition,
         TaskMetrics,
     )
-
-try:
-    from .constants import (
+    from constants import (
         SEPARATION_BY_WAKE,
         SCORE_WEIGHTS,
         METRIC_PRECISION,
