@@ -13,6 +13,7 @@ try:
         RunwaySpec,
         SlotAssignment,
     )
+    from .constants import SEPARATION_BY_WAKE
 except ImportError:
     from models import (
         ATCOptimizationObservation,
@@ -21,19 +22,7 @@ except ImportError:
         RunwaySpec,
         SlotAssignment,
     )
-
-
-SEPARATION_BY_WAKE: Dict[Tuple[str, str], int] = {
-    ("H", "H"): 4,
-    ("H", "M"): 5,
-    ("H", "L"): 6,
-    ("M", "H"): 3,
-    ("M", "M"): 3,
-    ("M", "L"): 4,
-    ("L", "H"): 3,
-    ("L", "M"): 3,
-    ("L", "L"): 3,
-}
+    from constants import SEPARATION_BY_WAKE
 
 PRIORITY_RANK = {
     PriorityClass.EMERGENCY: 0,

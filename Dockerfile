@@ -5,6 +5,9 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV API_BASE_URL=https://router.huggingface.co/v1
+ENV MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+ENV HF_TOKEN=
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl \

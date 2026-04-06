@@ -25,12 +25,13 @@ from planner import build_heuristic_plan
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("OPENAI_API_KEY")
-    or os.getenv("API_KEY")
-    or ""
-)
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    raise ValueError(
+        "HF_TOKEN environment variable is required. "
+        "Set it to your Hugging Face API token."
+    )
+API_KEY = HF_TOKEN
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", os.getenv("IMAGE_NAME", ""))
 BENCHMARK = "atc_optimization_openenv"
 TASK_IDS = [
@@ -39,7 +40,6 @@ TASK_IDS = [
     "bengaluru_irrops_hard",
 ]
 SUCCESS_SCORE_THRESHOLD = 0.65
-MAX_STEPS = 1
 MAX_TOKENS = 1400
 TEMPERATURE = 0
 
@@ -72,7 +72,7 @@ async def wait_for_server(base_url: str, timeout_s: float = 30.0) -> None:
                 response = await client.get(f"{base_url}/health")
                 if response.status_code == 200:
                     return
-            except Exception:
+            except (httpx.RequestError, httpx.TimeoutException):
                 pass
             await asyncio.sleep(0.5)
     raise RuntimeError(f"Timed out waiting for server health at {base_url}")
@@ -103,7 +103,7 @@ async def prepare_base_url() -> Tuple[str, Optional[subprocess.Popen]]:
     try:
         await wait_for_server(base_url)
         return base_url, process
-    except Exception:
+    except RuntimeError:
         process.terminate()
         raise
 
@@ -151,7 +151,14 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
         end = text.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"response is not JSON: {text[:120]}")
-        payload = json.loads(text[start : end + 1])
+        try:
+            payload = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON in response: {e}") from e
+        if not isinstance(payload, dict):
+            raise ValueError(f"response payload is not an object: {type(payload)}")
+        if "proposal" not in payload:
+            raise ValueError("response missing 'proposal' field")
         action = ATCOptimizationAction.model_validate(
             {
                 "proposal": payload["proposal"],
@@ -162,7 +169,7 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
         if len(action.proposal) < len(observation.flights):
             raise ValueError("model proposal omitted flights")
         return action
-    except Exception as exc:
+    except (ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"Model request failed for {task_id}: {exc}", file=sys.stderr, flush=True)
         return ATCOptimizationAction(
             proposal=heuristic_plan,
@@ -181,7 +188,8 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
 
     async with ATCOptimizationEnv(base_url=base_url) as env:
         result = await env.reset(task_id=task_id)
-        for step in range(1, MAX_STEPS + 1):
+        max_steps = result.observation.steps_remaining
+        for step in range(1, max_steps + 1):
             if result.done:
                 break
             action = get_model_action(client, result.observation, task_id)

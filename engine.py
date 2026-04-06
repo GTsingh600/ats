@@ -26,19 +26,28 @@ except ImportError:
         TaskMetrics,
     )
 
+try:
+    from .constants import (
+        SEPARATION_BY_WAKE,
+        SCORE_WEIGHTS,
+        METRIC_PRECISION,
+        FUEL_PRECISION,
+        AIRLINE_DELAY_PRECISION,
+        MAX_DIAGNOSTICS,
+        MAX_RECOMMENDATIONS,
+    )
+except ImportError:
+    from constants import (
+        SEPARATION_BY_WAKE,
+        SCORE_WEIGHTS,
+        METRIC_PRECISION,
+        FUEL_PRECISION,
+        AIRLINE_DELAY_PRECISION,
+        MAX_DIAGNOSTICS,
+        MAX_RECOMMENDATIONS,
+    )
 
-SEPARATION_BY_WAKE: Dict[Tuple[str, str], int] = {
-    ("H", "H"): 4,
-    ("H", "M"): 5,
-    ("H", "L"): 6,
-    ("M", "H"): 3,
-    ("M", "M"): 3,
-    ("M", "L"): 4,
-    ("L", "H"): 3,
-    ("L", "M"): 3,
-    ("L", "L"): 3,
-}
-
+# Build priority delay tolerance dynamically from models
 PRIORITY_DELAY_TOLERANCE: Dict[PriorityClass, int] = {
     PriorityClass.NORMAL: 35,
     PriorityClass.CONNECTION: 20,
@@ -183,7 +192,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     fuel_efficiency = max(0.0, 1.0 - (fuel_burn / task.fuel_budget))
 
     airline_averages = {
-        airline: round(sum(values) / len(values), 2)
+        airline: round(sum(values) / len(values), AIRLINE_DELAY_PRECISION)
         for airline, values in per_airline_delays.items()
         if values
     }
@@ -203,13 +212,14 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     if not recommendations:
         recommendations.append("The plan is operationally strong; minor gains remain in passenger delay reduction.")
 
+    # Calculate normalized score using defined weights
     normalized_score = (
-        0.24 * completeness
-        + 0.24 * conflict_free_ratio
-        + 0.18 * priority_handling
-        + 0.16 * delay_efficiency
-        + 0.10 * fairness
-        + 0.08 * fuel_efficiency
+        SCORE_WEIGHTS["completeness"] * completeness
+        + SCORE_WEIGHTS["conflict_free"] * conflict_free_ratio
+        + SCORE_WEIGHTS["priority"] * priority_handling
+        + SCORE_WEIGHTS["delay"] * delay_efficiency
+        + SCORE_WEIGHTS["fairness"] * fairness
+        + SCORE_WEIGHTS["fuel"] * fuel_efficiency
     )
     normalized_score *= completeness
     if conflict_count > 0:
@@ -217,17 +227,17 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     normalized_score = max(0.0, min(1.0, normalized_score))
 
     metrics = TaskMetrics(
-        schedule_completeness=round(completeness, 4),
-        conflict_free_ratio=round(conflict_free_ratio, 4),
-        priority_handling=round(priority_handling, 4),
-        delay_efficiency=round(delay_efficiency, 4),
-        fairness=round(fairness, 4),
-        fuel_efficiency=round(fuel_efficiency, 4),
+        schedule_completeness=round(completeness, METRIC_PRECISION),
+        conflict_free_ratio=round(conflict_free_ratio, METRIC_PRECISION),
+        priority_handling=round(priority_handling, METRIC_PRECISION),
+        delay_efficiency=round(delay_efficiency, METRIC_PRECISION),
+        fairness=round(fairness, METRIC_PRECISION),
+        fuel_efficiency=round(fuel_efficiency, METRIC_PRECISION),
         agent_judgment=0.0,
-        overall_score=round(normalized_score, 4),
+        overall_score=round(normalized_score, METRIC_PRECISION),
         total_delay_minutes=total_delay,
         max_delay_minutes=max_delay,
-        estimated_fuel_burn=round(fuel_burn, 2),
+        estimated_fuel_burn=round(fuel_burn, FUEL_PRECISION),
         conflict_count=conflict_count,
         capacity_violations=capacity_violations,
         priority_violations=priority_violations,
@@ -237,7 +247,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     )
     return SimulationOutcome(
         metrics=metrics,
-        diagnostics=diagnostics[:12],
-        recommendations=recommendations[:6],
+        diagnostics=diagnostics[:MAX_DIAGNOSTICS],
+        recommendations=recommendations[:MAX_RECOMMENDATIONS],
         normalized_score=normalized_score,
     )

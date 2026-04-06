@@ -154,7 +154,7 @@ class LLMSupervisorGrader(BaseTaskGrader):
             data = json.loads(raw_text)
             score = max(0.0, min(1.0, float(data.get("score", 0.0))))
             rationale_text = str(data.get("rationale", "LLM grader returned no rationale."))
-        except Exception as exc:
+        except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as exc:
             score = outcome.metrics.overall_score
             rationale_text = f"LLM grading failed, reverted to deterministic score: {exc}"
 

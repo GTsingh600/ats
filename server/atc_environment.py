@@ -107,12 +107,10 @@ class ATCOptimizationEnvironment(
     def step(
         self,
         action: ATCOptimizationAction,
-        timeout_s: Optional[float] = None,
         **_: object,
     ) -> ATCOptimizationObservation:
         """Score a candidate slot plan and emit dense reward feedback."""
 
-        del timeout_s
         if self._task is None:
             return self.reset()
 
