@@ -1,0 +1,9 @@
+ATC Benchmark Results — 20260407_171222
+
+Model                                           Avg    Easy     Med     Blr     Hyd
+----------------------------------------------------------------------------
+heuristic-baseline                           0.9136  0.9446  0.9907  0.8615  0.8576
+microsoft/Phi-3.5-mini-instruct              0.9136  0.9446  0.9907  0.8615  0.8576
+mistralai/Mistral-Nemo-Instruct-2407         0.9136  0.9446  0.9907  0.8615  0.8576
+Qwen/Qwen2.5-7B-Instruct                     0.6351  0.9999  0.9907  0.3000  0.2500
+Qwen/Qwen2.5-72B-Instruct                    0.4490  0.4000  0.9959  0.0000  0.4000

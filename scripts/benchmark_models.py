@@ -65,6 +65,7 @@ TASK_IDS = [
     "delhi_monsoon_recovery_easy",
     "mumbai_bank_balance_medium",
     "bengaluru_irrops_hard",
+    "hyderabad_cargo_crunch_medium_hard",
 ]
 
 MAX_TOKENS = 1400
@@ -298,17 +299,18 @@ def _print_summary(all_results: List[dict]) -> None:
     print(f"\n{'='*60}")
     print("  BENCHMARK SUMMARY")
     print(f"{'='*60}")
-    header = f"{'Model':<45} {'Avg':>6}  {'Easy':>6}  {'Medium':>6}  {'Hard':>6}"
+    header = f"{'Model':<44} {'Avg':>6}  {'Easy':>6}  {'Med':>6}  {'Blr':>6}  {'Hyd':>6}"
     print(header)
     print("-" * len(header))
     sorted_results = sorted(all_results, key=lambda r: r["avg_score"], reverse=True)
     for entry in sorted_results:
         scores = {t["task_id"]: t["score"] for t in entry["tasks"]}
-        easy   = scores.get("delhi_monsoon_recovery_easy", 0.0)
-        medium = scores.get("mumbai_bank_balance_medium", 0.0)
-        hard   = scores.get("bengaluru_irrops_hard", 0.0)
+        easy   = scores.get("delhi_monsoon_recovery_easy",       0.0)
+        medium = scores.get("mumbai_bank_balance_medium",         0.0)
+        blr    = scores.get("bengaluru_irrops_hard",             0.0)
+        hyd    = scores.get("hyderabad_cargo_crunch_medium_hard", 0.0)
         model_short = entry["model"][-44:] if len(entry["model"]) > 44 else entry["model"]
-        print(f"{model_short:<45} {entry['avg_score']:>6.4f}  {easy:>6.4f}  {medium:>6.4f}  {hard:>6.4f}")
+        print(f"{model_short:<44} {entry['avg_score']:>6.4f}  {easy:>6.4f}  {medium:>6.4f}  {blr:>6.4f}  {hyd:>6.4f}")
     print(f"{'='*60}\n")
 
 
@@ -353,15 +355,16 @@ async def main() -> None:
     # Save human-readable summary
     summary_lines = []
     summary_lines.append(f"ATC Benchmark Results — {timestamp}\n")
-    summary_lines.append(f"{'Model':<45} {'Avg':>6}  {'Easy':>6}  {'Med':>6}  {'Hard':>6}")
-    summary_lines.append("-" * 72)
+    summary_lines.append(f"{'Model':<44} {'Avg':>6}  {'Easy':>6}  {'Med':>6}  {'Blr':>6}  {'Hyd':>6}")
+    summary_lines.append("-" * 76)
     for entry in sorted(all_results, key=lambda r: r["avg_score"], reverse=True):
         scores = {t["task_id"]: t["score"] for t in entry["tasks"]}
-        easy   = scores.get("delhi_monsoon_recovery_easy", 0.0)
-        medium = scores.get("mumbai_bank_balance_medium", 0.0)
-        hard   = scores.get("bengaluru_irrops_hard", 0.0)
+        easy   = scores.get("delhi_monsoon_recovery_easy",       0.0)
+        medium = scores.get("mumbai_bank_balance_medium",         0.0)
+        blr    = scores.get("bengaluru_irrops_hard",             0.0)
+        hyd    = scores.get("hyderabad_cargo_crunch_medium_hard", 0.0)
         m = entry["model"][-44:]
-        summary_lines.append(f"{m:<45} {entry['avg_score']:>6.4f}  {easy:>6.4f}  {medium:>6.4f}  {hard:>6.4f}")
+        summary_lines.append(f"{m:<44} {entry['avg_score']:>6.4f}  {easy:>6.4f}  {medium:>6.4f}  {blr:>6.4f}  {hyd:>6.4f}")
     txt_path = OUTPUT_DIR / f"summary_{timestamp}.txt"
     txt_path.write_text("\n".join(summary_lines), encoding="utf-8")
     print(f"Summary saved: {txt_path}")

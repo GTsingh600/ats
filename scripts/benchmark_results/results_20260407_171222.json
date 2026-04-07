@@ -1,0 +1,316 @@
+[
+  {
+    "model": "heuristic-baseline",
+    "avg_score": 0.9136,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9446,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.5446,
+          0.0
+        ],
+        "total_reward": 0.9446,
+        "elapsed_s": 0.1,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.9907,
+        "success": true,
+        "steps": 2,
+        "rewards": [
+          0.3,
+          0.6907
+        ],
+        "total_reward": 0.9907,
+        "elapsed_s": 0.14,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8615,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.15,
+          0.6377,
+          0.0738,
+          0.0
+        ],
+        "total_reward": 0.8615,
+        "elapsed_s": 0.55,
+        "error": null
+      },
+      {
+        "task_id": "hyderabad_cargo_crunch_medium_hard",
+        "score": 0.8576,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.4576,
+          0.0
+        ],
+        "total_reward": 0.8576,
+        "elapsed_s": 0.03,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T17:12:27.732518+00:00"
+  },
+  {
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "avg_score": 0.6351,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9999,
+        "success": true,
+        "steps": 2,
+        "rewards": [
+          0.6518,
+          0.3481
+        ],
+        "total_reward": 0.9999,
+        "elapsed_s": 9.09,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.9907,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.3,
+          0.1,
+          0.5907
+        ],
+        "total_reward": 0.9907,
+        "elapsed_s": 16.43,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.3,
+        "success": false,
+        "steps": 4,
+        "rewards": [
+          0.3138,
+          -0.0638,
+          0.15,
+          -0.1
+        ],
+        "total_reward": 0.3,
+        "elapsed_s": 25.14,
+        "error": null
+      },
+      {
+        "task_id": "hyderabad_cargo_crunch_medium_hard",
+        "score": 0.25,
+        "success": false,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          -0.15,
+          0.0
+        ],
+        "total_reward": 0.25,
+        "elapsed_s": 8.69,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T17:13:27.268662+00:00"
+  },
+  {
+    "model": "microsoft/Phi-3.5-mini-instruct",
+    "avg_score": 0.9136,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9446,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.5446,
+          0.0
+        ],
+        "total_reward": 0.9446,
+        "elapsed_s": 1.02,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.9907,
+        "success": true,
+        "steps": 2,
+        "rewards": [
+          0.3,
+          0.6907
+        ],
+        "total_reward": 0.9907,
+        "elapsed_s": 0.72,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8615,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.15,
+          0.6377,
+          0.0738,
+          0.0
+        ],
+        "total_reward": 0.8615,
+        "elapsed_s": 1.58,
+        "error": null
+      },
+      {
+        "task_id": "hyderabad_cargo_crunch_medium_hard",
+        "score": 0.8576,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.4576,
+          0.0
+        ],
+        "total_reward": 0.8576,
+        "elapsed_s": 0.9,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T17:13:31.677162+00:00"
+  },
+  {
+    "model": "Qwen/Qwen2.5-72B-Instruct",
+    "avg_score": 0.449,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.4,
+        "success": false,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.5566,
+          -0.5566
+        ],
+        "total_reward": 0.4,
+        "elapsed_s": 61.11,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.9959,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.2,
+          0.2,
+          0.5959
+        ],
+        "total_reward": 0.9959,
+        "elapsed_s": 75.18,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.0,
+        "success": false,
+        "steps": 2,
+        "rewards": [
+          0.2,
+          0.574
+        ],
+        "total_reward": 0.774,
+        "elapsed_s": 98.77,
+        "error": "received 1011 (internal error) keepalive ping timeout; then sent 1011 (internal error) keepalive ping timeout"
+      },
+      {
+        "task_id": "hyderabad_cargo_crunch_medium_hard",
+        "score": 0.4,
+        "success": false,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.343,
+          -0.343
+        ],
+        "total_reward": 0.4,
+        "elapsed_s": 38.31,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T17:19:23.883503+00:00"
+  },
+  {
+    "model": "mistralai/Mistral-Nemo-Instruct-2407",
+    "avg_score": 0.9136,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9446,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.5446,
+          0.0
+        ],
+        "total_reward": 0.9446,
+        "elapsed_s": 1.14,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.9907,
+        "success": true,
+        "steps": 2,
+        "rewards": [
+          0.3,
+          0.6907
+        ],
+        "total_reward": 0.9907,
+        "elapsed_s": 0.73,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8615,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.15,
+          0.6377,
+          0.0738,
+          0.0
+        ],
+        "total_reward": 0.8615,
+        "elapsed_s": 1.67,
+        "error": null
+      },
+      {
+        "task_id": "hyderabad_cargo_crunch_medium_hard",
+        "score": 0.8576,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.4,
+          0.4576,
+          0.0
+        ],
+        "total_reward": 0.8576,
+        "elapsed_s": 0.87,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T17:19:28.471491+00:00"
+  }
+]
