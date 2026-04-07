@@ -51,6 +51,7 @@ class ATCOptimizationEnvironment(
         self._task: Optional[TaskDefinition] = None
         self._briefing = ""
         self._best_score = 0.0
+        self._previous_score = 0.0  # used for potential-based reward shaping
 
     def reset(
         self,
@@ -74,6 +75,7 @@ class ATCOptimizationEnvironment(
         self._task = task
         self._briefing = render_task_briefing(task)
         self._best_score = 0.0
+        self._previous_score = 0.0
         self._state = ATCOptimizationState(
             episode_id=episode_id or f"{task.task_id}-episode",
             step_count=0,
@@ -125,10 +127,10 @@ class ATCOptimizationEnvironment(
 
         previous_best = self._best_score
         current_score = composite.score
-        reward = round(
-            current_score if self._state.step_count == 0 else current_score - previous_best,
-            4,
-        )
+        # Potential-based reward shaping (Ng et al. 1999): F(s,s') = Φ(s') - Φ(s)
+        # Using previous *step* score as the state potential, not best-ever,
+        # ensuring the reward signal is policy-gradient-safe and Markovian.
+        reward = round(current_score - self._previous_score, 4)
         reward = max(-1.0, min(1.0, reward))
         done = (
             action.commit
@@ -162,6 +164,7 @@ class ATCOptimizationEnvironment(
             )
         )
         self._state.final_summary = self._build_summary(current_metrics, grades, done)
+        self._previous_score = current_score  # advance state potential for next step
 
         grader_feedback = [
             f"{grade.grader_name}: {grade.score:.3f} - {grade.rationale}" for grade in grades

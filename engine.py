@@ -107,6 +107,9 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     per_airline_delays: Dict[str, List[int]] = defaultdict(list)
     fuel_burn = 0.0
     priority_violations = 0
+    emergency_violations = 0
+    medical_violations = 0
+    connection_violations = 0
     capacity_violations = 0
 
     for assignment in assignment_map.values():
@@ -156,6 +159,12 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         tolerance = PRIORITY_DELAY_TOLERANCE[flight.priority]
         if delay > tolerance:
             priority_violations += 1
+            if flight.priority == PriorityClass.EMERGENCY:
+                emergency_violations += 1
+            elif flight.priority == PriorityClass.MEDICAL:
+                medical_violations += 1
+            elif flight.priority == PriorityClass.CONNECTION:
+                connection_violations += 1
             diagnostics.append(
                 f"{flight.flight_id} exceeds the {flight.priority.value} delay tolerance of {tolerance} minutes."
             )
@@ -190,7 +199,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         0.0,
         min(
             1.0,
-            (len(delays) - unknown_assignments - invalid_assignments) / max(1, len(task.flights)),
+            len(delays) / max(1, len(task.flights)),
         ),
     )
     conflict_free_ratio = max(
@@ -211,6 +220,24 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     }
     spread = pstdev(list(airline_averages.values())) if len(airline_averages) > 1 else 0.0
     fairness = max(0.0, 1.0 - (spread / task.fairness_tolerance))
+
+    # Connection impact: risk-weighted delay score for CONNECTION flights
+    connection_flights = [
+        f for f in task.flights if f.priority == PriorityClass.CONNECTION and f.connection_risk > 0
+    ]
+    if connection_flights:
+        # Budget: each connection flight is expected to tolerate up to its delay tolerance
+        weighted_actual = sum(
+            delays.get(f.flight_id, PRIORITY_DELAY_TOLERANCE[PriorityClass.CONNECTION]) * f.connection_risk
+            for f in connection_flights
+        )
+        weighted_budget = sum(
+            PRIORITY_DELAY_TOLERANCE[PriorityClass.CONNECTION] * f.connection_risk
+            for f in connection_flights
+        )
+        connection_impact_score = max(0.0, 1.0 - weighted_actual / max(1.0, weighted_budget))
+    else:
+        connection_impact_score = 1.0
 
     if completeness < 1.0:
         recommendations.append("Cover every flight in the scenario before refining the sequence.")
@@ -248,6 +275,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         delay_efficiency=round(delay_efficiency, METRIC_PRECISION),
         fairness=round(fairness, METRIC_PRECISION),
         fuel_efficiency=round(fuel_efficiency, METRIC_PRECISION),
+        connection_impact_score=round(connection_impact_score, METRIC_PRECISION),
         agent_judgment=0.0,
         overall_score=round(normalized_score, METRIC_PRECISION),
         total_delay_minutes=total_delay,
@@ -256,6 +284,9 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         conflict_count=conflict_count,
         capacity_violations=capacity_violations,
         priority_violations=priority_violations,
+        emergency_violations=emergency_violations,
+        medical_violations=medical_violations,
+        connection_violations=connection_violations,
         missing_assignments=missing_assignments,
         invalid_assignments=invalid_assignments + unknown_assignments,
         per_airline_average_delay=airline_averages,

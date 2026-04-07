@@ -1,20 +1,30 @@
-"""Task graders for benchmark scoring."""
+"""Task graders for benchmark scoring.
+
+Architecture (3-layer gated design):
+  Layer 1 — SafetyGateEvaluator:    Hard constraint gates. Any violation caps the ceiling score.
+  Layer 2 — PriorityRubricGrader:   Grades quality of emergency/medical/connection prioritization.
+  Layer 3 — EfficiencyRubricGrader: Grades operational efficiency (delay, fuel, fairness, connection impact).
+  GatedCompositeGrader:             Official score = min(gate_ceiling, 0.30*priority + 0.70*efficiency).
+
+  LLMSupervisorGrader runs independently as auxiliary information only and is NOT part of the
+  official composite score.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, OpenAIError, RateLimitError
 
 try:
     from .engine import SimulationOutcome
-    from .models import SlotAssignment, TaskDefinition, TaskGrade
+    from .models import PriorityClass, SlotAssignment, TaskDefinition, TaskGrade
 except ImportError:
     from engine import SimulationOutcome
-    from models import SlotAssignment, TaskDefinition, TaskGrade
+    from models import PriorityClass, SlotAssignment, TaskDefinition, TaskGrade
 
 
 STRICT_SCORE_EPSILON = 1e-4
@@ -22,10 +32,124 @@ STRICT_SCORE_EPSILON = 1e-4
 
 def _strict_score(value: float) -> float:
     """Normalize to the strict open interval (0, 1) with stable output precision."""
-
     clipped = max(STRICT_SCORE_EPSILON, min(1.0 - STRICT_SCORE_EPSILON, float(value)))
     return round(clipped, 4)
 
+
+# ── Layer 1: Hard Safety Gates ────────────────────────────────────────────────
+
+class SafetyGateEvaluator:
+    """Computes the hard constraint ceiling that caps the final composite score.
+
+    Violations of safety-critical rules (separation conflicts, incomplete schedule,
+    emergency flight delayed) set a score ceiling regardless of efficiency metrics.
+    This mirrors real-world ATC: a conflicting plan is REJECTED, not averaged.
+    """
+
+    def evaluate(
+        self, outcome: SimulationOutcome, task: TaskDefinition
+    ) -> Tuple[float, List[str]]:
+        """Return (ceiling, list_of_gate_violation_descriptions)."""
+        ceiling = 1.0
+        violations: List[str] = []
+
+        # Gate 1: Separation conflicts — hardest veto (each extra conflict makes it worse)
+        if outcome.metrics.conflict_count > 0:
+            # First conflict drops to 0.40; each additional conflict reduces further, minimum 0.10
+            conflict_ceiling = max(0.10, 0.40 - 0.05 * (outcome.metrics.conflict_count - 1))
+            ceiling = min(ceiling, conflict_ceiling)
+            violations.append(
+                f"{outcome.metrics.conflict_count} separation conflict(s) detected — plan is operationally unsafe"
+            )
+
+        # Gate 2: Incomplete schedule
+        if outcome.metrics.missing_assignments > 0:
+            missing = outcome.metrics.missing_assignments
+            # Each missing flight reduces ceiling further, minimum 0.20
+            completeness_ceiling = max(0.20, 0.50 - 0.04 * missing)
+            ceiling = min(ceiling, completeness_ceiling)
+            violations.append(
+                f"{missing} flight(s) unassigned — schedule is incomplete"
+            )
+
+        # Gate 3: Emergency flight delay violation — life-safety ceiling
+        if outcome.metrics.emergency_violations > 0:
+            ceiling = min(ceiling, 0.35)
+            violations.append(
+                "EMERGENCY flight delay tolerance exceeded — life-safety risk"
+            )
+
+        return ceiling, violations
+
+
+# ── Layer 2: Priority Rubric ──────────────────────────────────────────────────
+
+class PriorityRubricGrader:
+    """Grades the quality of priority-aware sequencing decisions.
+
+    Emergency protection is binary (0 or 1). Medical and connection handling
+    are graded proportionally. Connection scoring uses the connection_risk field
+    via the pre-computed connection_impact_score in metrics.
+    """
+
+    def grade(self, task: TaskDefinition, outcome: SimulationOutcome) -> float:
+        metrics = outcome.metrics
+
+        # Emergency: binary — any violation collapses this to 0.0
+        emergency_count = sum(
+            1 for f in task.flights if f.priority == PriorityClass.EMERGENCY
+        )
+        if emergency_count > 0:
+            emergency_score = 0.0 if metrics.emergency_violations > 0 else 1.0
+        else:
+            emergency_score = 1.0  # No emergency flights = no penalty
+
+        # Medical: partial credit proportional to violations
+        medical_count = sum(
+            1 for f in task.flights if f.priority == PriorityClass.MEDICAL
+        )
+        if medical_count > 0:
+            medical_score = max(0.0, 1.0 - metrics.medical_violations / medical_count)
+        else:
+            medical_score = 1.0
+
+        # Connection: uses the risk-weighted connection_impact_score from engine
+        # (0.0 = all high-risk connections were heavily delayed; 1.0 = all protected)
+        connection_score = metrics.connection_impact_score
+
+        return 0.50 * emergency_score + 0.30 * medical_score + 0.20 * connection_score
+
+
+# ── Layer 3: Efficiency Rubric ────────────────────────────────────────────────
+
+class EfficiencyRubricGrader:
+    """Grades the operational efficiency dimensions of the plan.
+
+    Weights are domain-derived:
+      delay        0.35 — total system delay is the primary efficiency metric (ICAO)
+      fuel         0.25 — fuel burn directly impacts cost and environment
+      fairness     0.20 — equitable delay distribution across airlines (IATA WSG)
+      connection   0.20 — risk-weighted connection impact (previously unused field)
+    """
+
+    WEIGHTS: Dict[str, float] = {
+        "delay": 0.35,
+        "fuel": 0.25,
+        "fairness": 0.20,
+        "connection_impact": 0.20,
+    }
+
+    def grade(self, outcome: SimulationOutcome) -> float:
+        m = outcome.metrics
+        return (
+            self.WEIGHTS["delay"] * m.delay_efficiency
+            + self.WEIGHTS["fuel"] * m.fuel_efficiency
+            + self.WEIGHTS["fairness"] * m.fairness
+            + self.WEIGHTS["connection_impact"] * m.connection_impact_score
+        )
+
+
+# ── Composite Grader (Official Score) ────────────────────────────────────────
 
 class BaseTaskGrader(ABC):
     """Base class for task graders."""
@@ -43,73 +167,24 @@ class BaseTaskGrader(ABC):
         """Return a score in the strict range (0.0, 1.0)."""
 
 
-class SupervisorHeuristicGrader(BaseTaskGrader):
-    """Deterministic controller-in-the-loop style grader."""
+class GatedCompositeGrader(BaseTaskGrader):
+    """Official deterministic benchmark score.
 
-    grader_name = "supervisor_heuristic"
+    Formula:
+        raw   = 0.30 * priority_score + 0.70 * efficiency_score
+        score = min(gate_ceiling, raw)
 
-    def grade(
-        self,
-        task: TaskDefinition,
-        outcome: SimulationOutcome,
-        proposal: Iterable[SlotAssignment],
-        rationale: str = "",
-    ) -> TaskGrade:
-        # Change timeline:
-        # - 43bbf9a/d6b41a8/149cb7a used `len(list(proposal))`.
-        # - 13c984e changed this line to avoid materializing/consuming iterators
-        #   when `proposal` is already a Sequence.
-        proposal_count = len(proposal) if isinstance(proposal, Sequence) else sum(1 for _ in proposal)
-        rationale_bonus = 0.08 if len(rationale.split()) >= 12 else 0.03 if rationale else 0.0
-        diagnostic_penalty = min(0.12, 0.01 * len(outcome.diagnostics))
-        missing_penalty = min(
-            0.35,
-            0.05 * outcome.metrics.missing_assignments
-            + 0.04 * outcome.metrics.invalid_assignments,
-        )
-        score = max(
-            0.0,
-            min(
-                1.0,
-                0.30 * outcome.metrics.schedule_completeness
-                + 0.25 * outcome.metrics.conflict_free_ratio
-                + 0.18 * outcome.metrics.priority_handling
-                + 0.10 * outcome.metrics.fairness
-                + 0.08 * outcome.metrics.delay_efficiency
-                + 0.04 * outcome.metrics.fuel_efficiency
-                + 0.05 * min(1.0, proposal_count / max(1, len(task.flights)))
-                + rationale_bonus
-                - diagnostic_penalty,
-            ),
-        )
-        score = max(0.0, min(1.0, score - missing_penalty))
-        rationale_text = (
-            "The supervisor accepted the proposal as operationally credible."
-            if score >= 0.8
-            else "The supervisor found the plan partially acceptable but still risky."
-            if score >= 0.5
-            else "The supervisor rejected the plan because safety or prioritization remained weak."
-        )
-        return TaskGrade(
-            grader_name=self.grader_name,
-            score=_strict_score(score),
-            rationale=rationale_text,
-            sub_scores={
-                "conflict_free_ratio": _strict_score(outcome.metrics.conflict_free_ratio),
-                "priority_handling": _strict_score(outcome.metrics.priority_handling),
-                "fairness": _strict_score(outcome.metrics.fairness),
-                "delay_efficiency": _strict_score(outcome.metrics.delay_efficiency),
-            },
-        )
+    Safety gates (Layer 1) apply a hard ceiling: a plan with conflicts or missing
+    flights can never compensate with excellent efficiency scores. This prevents
+    reward hacking and aligns with FAA GDP evaluation practice.
+    """
 
+    grader_name = "composite_task_grader"
 
-class DeterministicAuditGrader(BaseTaskGrader):
-    """Explicit exploit-resistant audit used in the official submission score."""
-    # Change timeline:
-    # - Introduced in 149cb7a as a new deterministic safety/efficiency audit.
-    # - 13c984e kept the scoring formula and thresholds unchanged.
-
-    grader_name = "deterministic_audit"
+    def __init__(self) -> None:
+        self._safety_gate = SafetyGateEvaluator()
+        self._priority = PriorityRubricGrader()
+        self._efficiency = EfficiencyRubricGrader()
 
     def grade(
         self,
@@ -118,59 +193,42 @@ class DeterministicAuditGrader(BaseTaskGrader):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
-        del task, proposal, rationale
-        metrics = outcome.metrics
-        safety_score = max(
-            0.0,
-            1.0
-            - 0.30 * metrics.conflict_count
-            - 0.12 * metrics.invalid_assignments
-            - 0.10 * metrics.missing_assignments
-            - 0.10 * metrics.priority_violations,
-        )
-        efficiency_score = max(
-            0.0,
-            min(
-                1.0,
-                0.55 * metrics.delay_efficiency
-                + 0.25 * metrics.fairness
-                + 0.20 * metrics.fuel_efficiency,
-            ),
-        )
-        score = max(
-            0.0,
-            min(
-                1.0,
-                0.70 * safety_score
-                + 0.30 * efficiency_score,
-            ),
-        )
-        rationale_text = (
-            "The deterministic audit found the plan safe, complete, and operationally balanced."
-            if score >= 0.85
-            else "The deterministic audit accepted the plan but found avoidable operational weaknesses."
-            if score >= 0.55
-            else "The deterministic audit rejected the plan because it remained unsafe, incomplete, or poorly prioritized."
-        )
+        ceiling, gate_violations = self._safety_gate.evaluate(outcome, task)
+        priority_score = self._priority.grade(task, outcome)
+        efficiency_score = self._efficiency.grade(outcome)
+
+        raw = 0.30 * priority_score + 0.70 * efficiency_score
+        final = min(ceiling, max(0.0, raw))
+
+        if gate_violations:
+            status = f"GATED at {ceiling:.3f} — {'; '.join(gate_violations)}."
+        elif final >= 0.85:
+            status = "Plan accepted: safe, complete, and operationally balanced."
+        elif final >= 0.55:
+            status = "Plan accepted with operational weaknesses remaining."
+        else:
+            status = "Plan scored low on efficiency or priority dimensions."
+
         return TaskGrade(
             grader_name=self.grader_name,
-            score=_strict_score(score),
-            rationale=rationale_text,
+            score=_strict_score(final),
+            rationale=status,
             sub_scores={
-                "safety_score": _strict_score(safety_score),
-                "efficiency_score": _strict_score(efficiency_score),
+                "gate_ceiling": round(ceiling, 4),
+                "priority_score": round(priority_score, 4),
+                "efficiency_score": round(efficiency_score, 4),
             },
         )
 
+
+# ── Auxiliary LLM Grader (non-official) ─────────────────────────────────────
 
 class LLMSupervisorGrader(BaseTaskGrader):
-    """Optional LLM-backed supervisor used when credentials are available."""
-    # Change timeline:
-    # - 43bbf9a initially parsed with `json.loads(raw_text)` and used broad
-    #   `except Exception` fallback.
-    # - d6b41a8 narrowed fallback exceptions to parse/shape errors.
-    # - 13c984e added API error classes, JSON object extraction, payload type
-    #   validation, and explicit handling for transport/rate-limit/timeouts.
+    """Optional LLM-backed supervisor used when credentials are available.
+
+    This grader is AUXILIARY ONLY and does NOT contribute to the official
+    composite score. It is preserved as a side-channel for analysis.
+    """
 
     grader_name = "llm_supervisor"
 
@@ -234,14 +292,11 @@ class LLMSupervisorGrader(BaseTaskGrader):
                 ],
             )
             raw_text = (response.choices[0].message.content or "").strip()
-            # 13c984e: tolerate wrappers like markdown/code fences by slicing to
-            # the first JSON object instead of requiring pure JSON text.
             start = raw_text.find("{")
             end = raw_text.rfind("}")
-            if start == -1 or end == -1:
-                raise ValueError("LLM grader response is not JSON")
-            data = json.loads(raw_text[start : end + 1])
-            # 13c984e: enforce object payload so downstream `.get(...)` calls are safe.
+            if start == -1 or end == -1 or start > end:
+                raise ValueError("LLM grader response contains no valid JSON object")
+            data = json.loads(raw_text[start: end + 1])
             if not isinstance(data, dict):
                 raise ValueError("LLM grader payload must be a JSON object")
             score = max(0.0, min(1.0, float(data.get("score", 0.0))))
@@ -269,56 +324,7 @@ class LLMSupervisorGrader(BaseTaskGrader):
         )
 
 
-class CompositeTaskGrader(BaseTaskGrader):
-    """Official deterministic benchmark score used for submission comparisons."""
-    # Change timeline:
-    # - 43bbf9a/d6b41a8 blended heuristic + LLM (`self.llm`, "llm" sub-score).
-    # - 149cb7a replaced LLM contribution with DeterministicAuditGrader
-    #   (`self.audit`, "audit" sub-score) for reproducible official scoring.
-    # - 13c984e kept formula but updated rationale wording for comparability and
-    #   avoided unnecessary proposal list copies when already a list.
-
-    grader_name = "composite_task_grader"
-
-    def __init__(self) -> None:
-        self.heuristic = SupervisorHeuristicGrader()
-        self.audit = DeterministicAuditGrader()
-
-    def grade(
-        self,
-        task: TaskDefinition,
-        outcome: SimulationOutcome,
-        proposal: Iterable[SlotAssignment],
-        rationale: str = "",
-    ) -> TaskGrade:
-        # 13c984e: no-op for list inputs, materialize once for one-shot iterables.
-        proposal_list = proposal if isinstance(proposal, list) else list(proposal)
-        heuristic = self.heuristic.grade(task, outcome, proposal_list, rationale)
-        audit = self.audit.grade(task, outcome, proposal_list, rationale)
-        final_score = max(
-            0.0,
-            min(
-                1.0,
-                0.65 * outcome.metrics.overall_score
-                + 0.20 * heuristic.score
-                + 0.15 * audit.score,
-            ),
-        )
-        rationale_text = (
-            "Official score is deterministic for reproducible benchmarking and hackathon comparability. "
-            f"Heuristic supervisor: {heuristic.rationale} "
-            f"Deterministic audit: {audit.rationale}"
-        )
-        return TaskGrade(
-            grader_name=self.grader_name,
-            score=_strict_score(final_score),
-            rationale=rationale_text,
-            sub_scores={
-                "heuristic": heuristic.score,
-                "audit": audit.score,
-            },
-        )
-
+# ── Public Entry Point ────────────────────────────────────────────────────────
 
 def grade_task(
     task: TaskDefinition,
@@ -326,17 +332,16 @@ def grade_task(
     proposal: Iterable[SlotAssignment],
     rationale: str = "",
 ) -> List[TaskGrade]:
-    """Run all task graders and return their scores."""
+    """Run all task graders and return their scores.
 
-    # Lineup timeline:
-    # - 43bbf9a/d6b41a8: heuristic -> llm -> composite
-    # - 149cb7a+: heuristic -> deterministic_audit -> composite -> llm
-    graders: List[BaseTaskGrader] = [
-        SupervisorHeuristicGrader(),
-        DeterministicAuditGrader(),
-        CompositeTaskGrader(),
-        LLMSupervisorGrader(),
-    ]
-    # 13c984e: preserve list proposals as-is; only materialize iterables once.
+    Each sub-grader is instantiated once and called once. The composite grader
+    does NOT internally re-run sub-graders (no duplicate computation).
+
+    Order: [composite, llm_supervisor]
+      - composite_task_grader: official benchmark score (deterministic, gated)
+      - llm_supervisor:        auxiliary LLM signal (non-official)
+    """
     proposal_list = proposal if isinstance(proposal, list) else list(proposal)
-    return [grader.grade(task, outcome, proposal_list, rationale) for grader in graders]
+    composite = GatedCompositeGrader().grade(task, outcome, proposal_list, rationale)
+    llm = LLMSupervisorGrader().grade(task, outcome, proposal_list, rationale)
+    return [composite, llm]

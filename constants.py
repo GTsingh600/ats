@@ -23,25 +23,7 @@ SEPARATION_BY_WAKE: Dict[Tuple[str, str], int] = {
     ("L", "L"): 3,  # Light to Light: 3 min
 }
 
-# ============================================================================
-# Priority Delay Tolerance (minutes)
-# ============================================================================
-# Maximum acceptable delay by priority class before penalty applied
-from enum import Enum
 
-class PriorityClass(str, Enum):
-    """Priority classification for flights."""
-    NORMAL = "normal"
-    CONNECTION = "connection"
-    MEDICAL = "medical"
-    EMERGENCY = "emergency"
-
-PRIORITY_DELAY_TOLERANCE: Dict[str, int] = {
-    "normal": 35,        # Normal flights: up to 35 min delay acceptable
-    "connection": 20,    # Connection flights: up to 20 min delay
-    "medical": 10,       # Medical flights: up to 10 min delay
-    "emergency": 5,      # Emergency: up to 5 min delay
-}
 
 # ============================================================================
 # Normalized Score Calculation Weights
@@ -122,7 +104,6 @@ SPACING_VIOLATION_MSG_TEMPLATE = "Runway {runway} has {prev_flight}->{curr_fligh
 # ============================================================================
 __all__ = [
     "SEPARATION_BY_WAKE",
-    "PRIORITY_DELAY_TOLERANCE",
     "SCORE_WEIGHTS",
     "COMPLETENESS_PENALTY_FACTOR",
     "CONFLICT_PENALTY_FACTOR",

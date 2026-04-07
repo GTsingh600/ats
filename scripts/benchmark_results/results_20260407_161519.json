@@ -1,0 +1,245 @@
+[
+  {
+    "model": "heuristic-baseline",
+    "avg_score": 0.9271,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.964,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.7877,
+          0.1763,
+          0.0
+        ],
+        "total_reward": 0.964,
+        "elapsed_s": 0.11,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.955,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.6155,
+          0.3395,
+          0.0
+        ],
+        "total_reward": 0.955,
+        "elapsed_s": 0.21,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8623,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.2,
+          0.6623,
+          0.0,
+          0.0
+        ],
+        "total_reward": 0.8623,
+        "elapsed_s": 0.49,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T16:15:25.513158+00:00"
+  },
+  {
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "avg_score": 0.7706,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9568,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.7244,
+          0.2396,
+          -0.0072
+        ],
+        "total_reward": 0.9568,
+        "elapsed_s": 9.69,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.955,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.6155,
+          0.3395,
+          0.0
+        ],
+        "total_reward": 0.955,
+        "elapsed_s": 12.66,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.4,
+        "success": false,
+        "steps": 4,
+        "rewards": [
+          0.15,
+          0.25,
+          -0.05,
+          0.05
+        ],
+        "total_reward": 0.4,
+        "elapsed_s": 24.29,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T16:16:12.317519+00:00"
+  },
+  {
+    "model": "microsoft/Phi-3.5-mini-instruct",
+    "avg_score": 0.9271,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.964,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.7877,
+          0.1763,
+          0.0
+        ],
+        "total_reward": 0.964,
+        "elapsed_s": 0.96,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.955,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.6155,
+          0.3395,
+          0.0
+        ],
+        "total_reward": 0.955,
+        "elapsed_s": 1.06,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8623,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.2,
+          0.6623,
+          0.0,
+          0.0
+        ],
+        "total_reward": 0.8623,
+        "elapsed_s": 1.65,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T16:16:16.177850+00:00"
+  },
+  {
+    "model": "Qwen/Qwen2.5-72B-Instruct",
+    "avg_score": 0.3333,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.9999,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.9424,
+          -0.5424,
+          0.5999
+        ],
+        "total_reward": 0.9999,
+        "elapsed_s": 42.22,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.0,
+        "success": false,
+        "steps": 1,
+        "rewards": [
+          0.3
+        ],
+        "total_reward": 0.3,
+        "elapsed_s": 40.2,
+        "error": "received 1011 (internal error) keepalive ping timeout; then sent 1011 (internal error) keepalive ping timeout"
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.0,
+        "success": false,
+        "steps": 0,
+        "rewards": [],
+        "total_reward": 0,
+        "elapsed_s": 58.23,
+        "error": "no close frame received or sent"
+      }
+    ],
+    "timestamp": "2026-04-07T16:24:51.683634+00:00"
+  },
+  {
+    "model": "mistralai/Mistral-Nemo-Instruct-2407",
+    "avg_score": 0.9271,
+    "tasks": [
+      {
+        "task_id": "delhi_monsoon_recovery_easy",
+        "score": 0.964,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.7877,
+          0.1763,
+          0.0
+        ],
+        "total_reward": 0.964,
+        "elapsed_s": 1.05,
+        "error": null
+      },
+      {
+        "task_id": "mumbai_bank_balance_medium",
+        "score": 0.955,
+        "success": true,
+        "steps": 3,
+        "rewards": [
+          0.6155,
+          0.3395,
+          0.0
+        ],
+        "total_reward": 0.955,
+        "elapsed_s": 1.07,
+        "error": null
+      },
+      {
+        "task_id": "bengaluru_irrops_hard",
+        "score": 0.8623,
+        "success": true,
+        "steps": 4,
+        "rewards": [
+          0.2,
+          0.6623,
+          0.0,
+          0.0
+        ],
+        "total_reward": 0.8623,
+        "elapsed_s": 1.62,
+        "error": null
+      }
+    ],
+    "timestamp": "2026-04-07T16:24:55.618898+00:00"
+  }
+]

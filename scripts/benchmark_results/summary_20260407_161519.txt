@@ -1,0 +1,9 @@
+ATC Benchmark Results — 20260407_161519
+
+Model                                            Avg    Easy     Med    Hard
+------------------------------------------------------------------------
+heuristic-baseline                            0.9271  0.9640  0.9550  0.8623
+microsoft/Phi-3.5-mini-instruct               0.9271  0.9640  0.9550  0.8623
+mistralai/Mistral-Nemo-Instruct-2407          0.9271  0.9640  0.9550  0.8623
+Qwen/Qwen2.5-7B-Instruct                      0.7706  0.9568  0.9550  0.4000
+Qwen/Qwen2.5-72B-Instruct                     0.3333  0.9999  0.0000  0.0000
