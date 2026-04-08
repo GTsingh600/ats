@@ -1,27 +1,38 @@
 spec_version: 1
 name: atc_env
 version: 1.0.0
-description: "Realistic air traffic control disruption recovery benchmark. Agents manage runway slot plans under tight constraints."
+description: Realistic air traffic control disruption recovery benchmark. Agents manage
+  runway slot plans under tight constraints.
 type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
-
 tags:
-  - openenv
-  - air-traffic-control
-  - optimization
-
+- openenv
+- air-traffic-control
+- optimization
 tasks:
-  - id: delhi_monsoon_recovery_easy
-    difficulty: easy
-    grader: graders:GatedCompositeGrader
-  - id: mumbai_bank_balance_medium
-    difficulty: medium
-    grader: graders:GatedCompositeGrader
-  - id: bengaluru_irrops_hard
-    difficulty: hard
-    grader: graders:GatedCompositeGrader
-  - id: hyderabad_cargo_crunch_medium_hard
-    difficulty: hard
-    grader: graders:GatedCompositeGrader
+- id: delhi_monsoon_recovery_easy
+  difficulty: easy
+  grader:
+    type: programmatic
+    module: graders:GatedCompositeGrader
+  max_steps: 10
+- id: mumbai_bank_balance_medium
+  difficulty: medium
+  grader:
+    type: programmatic
+    module: graders:GatedCompositeGrader
+  max_steps: 14
+- id: bengaluru_irrops_hard
+  difficulty: hard
+  grader:
+    type: programmatic
+    module: graders:GatedCompositeGrader
+  max_steps: 18
+- id: hyderabad_cargo_crunch_medium_hard
+  difficulty: hard
+  grader:
+    type: programmatic
+    module: graders:GatedCompositeGrader
+  max_steps: 20
