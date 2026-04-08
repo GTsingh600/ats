@@ -35,6 +35,7 @@ TASK_IDS = [
     "mumbai_bank_balance_medium",
     "bengaluru_irrops_hard",
 ]
+SCORE_EPSILON = 0.01
 SUCCESS_SCORE_THRESHOLD = 0.65
 SCORE_EPSILON = 0.01
 MAX_STEPS_CAP = int(os.getenv("MAX_STEPS_CAP", "4"))
@@ -54,6 +55,13 @@ def _safe_print(msg: str) -> None:
     """Print to stdout, silently ignoring broken pipe errors."""
     try:
         print(msg, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _safe_stderr(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
     except (BrokenPipeError, OSError):
         pass
 
@@ -262,10 +270,14 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
                 break
 
         score = max(SCORE_EPSILON, min(1.0 - SCORE_EPSILON, result.observation.current_metrics.overall_score))
+        score = max(
+            SCORE_EPSILON,
+            min(1.0 - SCORE_EPSILON, result.observation.current_metrics.overall_score),
+        )
         success = score >= SUCCESS_SCORE_THRESHOLD
         return score
-    except (RuntimeError, ValueError, KeyError, TypeError) as exc:
-        print(f"Task execution failed for {task_id}: {exc}", file=sys.stderr, flush=True)
+    except Exception as exc:
+        _safe_stderr(f"Task execution failed for {task_id}: {exc}")
         return SCORE_EPSILON
     finally:
         if env is not None:
@@ -281,10 +293,7 @@ async def main() -> None:
         for task_id in TASK_IDS:
             await run_task(client, base_url, task_id)
     except Exception as exc:
-        try:
-            print(f"[FATAL] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-        except (BrokenPipeError, OSError):
-            pass
+        _safe_stderr(f"[FATAL] {type(exc).__name__}: {exc}")
     finally:
         if process is not None:
             process.terminate()
@@ -295,11 +304,19 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
     # On Linux, reset SIGPIPE to default so broken-pipe produces a clean exit
     # instead of a Python exception.  On Windows this signal doesn't exist.
     if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-
+        try:
+            signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        except Exception:
+            pass
     try:
         asyncio.run(main())
     except (BrokenPipeError, OSError, KeyboardInterrupt):

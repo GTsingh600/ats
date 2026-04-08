@@ -10,6 +10,8 @@ ENV MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
 ENV HF_TOKEN=
 ENV PYTHONPATH=/app
 ENV PATH="/app/.venv/bin:${PATH}"
+ENV PYTHONUTF8=1
+ENV PYTHONIOENCODING=UTF-8
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl \
