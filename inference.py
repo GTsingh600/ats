@@ -69,10 +69,10 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(task: str, success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_text = ",".join(f"{item:.2f}" for item in rewards)
     _safe_print(
-        f"[END] success={_bool_token(success)} steps={steps} score={score:.2f} rewards={rewards_text}"
+        f"[END] task={task} success={_bool_token(success)} steps={steps} score={score:.2f} rewards={rewards_text}"
     )
 
 
@@ -270,7 +270,7 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
     finally:
         if env is not None:
             await env.__aexit__(None, None, None)
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(task=task_id, success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 async def main() -> None:
