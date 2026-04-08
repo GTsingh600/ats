@@ -192,6 +192,11 @@
       overflow: hidden;
     }
 
+    .scene-stage-inner {
+      position: absolute;
+      inset: 0;
+    }
+
     .scene-stage::before {
       content: "";
       position: absolute;
@@ -234,10 +239,11 @@
 
     .holding-ring {
       position: absolute;
-      left: 9.5%;
-      top: 25%;
-      width: 80px;
-      height: 80px;
+      left: 18%;
+      top: 40%;
+      width: 18%;
+      aspect-ratio: 1;
+      transform: translate(-50%, -50%);
       border-radius: 50%;
       border: 1px dashed rgba(197, 166, 106, 0.28);
       opacity: 0;
@@ -258,19 +264,28 @@
       stroke-dasharray: 6 7;
     }
 
-    .plane {
+    .flight-unit {
       position: absolute;
-      width: 86px;
-      left: 26px;
-      top: 132px;
-      transform-origin: center center;
+      left: 12%;
+      top: 62%;
+      width: clamp(88px, 13%, 120px);
+      transform: translate(-50%, -50%) rotate(-6deg);
+      transform-origin: 50% 50%;
       filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
+      z-index: 2;
+    }
+
+    .plane {
+      position: relative;
+      width: 100%;
     }
 
     .plane svg { width: 100%; height: auto; display: block; }
     .plane-body { fill: #f3f5f7; }
     .plane-wing { fill: #bfc8d0; }
     .plane-accent { fill: var(--gold); }
+    .plane-tail { fill: #8aa2b7; }
+    .plane-window { fill: #31404d; }
 
     .smoke,
     .impact {
@@ -280,40 +295,44 @@
     }
 
     .smoke {
-      right: 18%;
-      bottom: 56px;
-      width: 100px;
-      height: 100px;
+      left: 16%;
+      top: 52%;
+      width: 66%;
+      aspect-ratio: 1;
+      transform: translate(-72%, -50%) scale(0.86);
       border-radius: 50%;
       background: radial-gradient(circle, rgba(255,255,255,0.36) 0%, rgba(203, 111, 102, 0.2) 38%, rgba(255,255,255,0.0) 72%);
     }
 
     .impact {
-      right: 18%;
-      bottom: 62px;
-      width: 24px;
-      height: 24px;
+      left: 88%;
+      top: 50%;
+      width: 28%;
+      aspect-ratio: 1;
+      transform: translate(-50%, -50%) scale(0.8);
       border-radius: 50%;
       background: radial-gradient(circle, rgba(255, 255, 255, 0.95) 0%, rgba(216, 162, 97, 0.92) 42%, rgba(203, 111, 102, 0.0) 72%);
     }
 
-    .scene-card[data-scene="ready"] .plane {
-      transform: translate(0, 0) rotate(-8deg);
+    .scene-card[data-scene="ready"] .flight-unit {
+      left: 12%;
+      top: 62%;
+      transform: translate(-50%, -50%) rotate(-4deg);
     }
 
-    .scene-card[data-scene="inference"] .plane {
+    .scene-card[data-scene="inference"] .flight-unit {
       animation: inference-flight 5s linear infinite;
     }
 
-    .scene-card[data-scene="landing"] .plane {
+    .scene-card[data-scene="landing"] .flight-unit {
       animation: landing-flight 3.6s ease-in-out forwards;
     }
 
-    .scene-card[data-scene="approach"] .plane {
+    .scene-card[data-scene="approach"] .flight-unit {
       animation: approach-flight 4.6s ease-in-out infinite;
     }
 
-    .scene-card[data-scene="holding"] .plane {
+    .scene-card[data-scene="holding"] .flight-unit {
       animation: holding-flight 5.4s linear infinite;
     }
 
@@ -321,7 +340,7 @@
       opacity: 1;
     }
 
-    .scene-card[data-scene="warning"] .plane {
+    .scene-card[data-scene="warning"] .flight-unit {
       animation: warning-flight 2.2s ease-in-out infinite;
     }
 
@@ -331,7 +350,7 @@
       animation: blink 0.75s steps(2, end) infinite;
     }
 
-    .scene-card[data-scene="crash"] .plane {
+    .scene-card[data-scene="crash"] .flight-unit {
       animation: crash-flight 2.8s ease-in forwards;
     }
 
@@ -593,53 +612,53 @@
     }
 
     @keyframes inference-flight {
-      0% { transform: translate(0, 0) rotate(-8deg); }
-      35% { transform: translate(210px, -38px) rotate(-6deg); }
-      70% { transform: translate(430px, -8px) rotate(2deg); }
-      100% { transform: translate(610px, -22px) rotate(-4deg); }
+      0% { left: 12%; top: 62%; transform: translate(-50%, -50%) rotate(-5deg); }
+      35% { left: 36%; top: 40%; transform: translate(-50%, -50%) rotate(-9deg); }
+      70% { left: 64%; top: 48%; transform: translate(-50%, -50%) rotate(2deg); }
+      100% { left: 88%; top: 36%; transform: translate(-50%, -50%) rotate(-7deg); }
     }
 
     @keyframes landing-flight {
-      0% { transform: translate(0, 0) rotate(-10deg); }
-      55% { transform: translate(410px, -58px) rotate(-6deg); }
-      100% { transform: translate(650px, 86px) rotate(6deg); }
+      0% { left: 12%; top: 56%; transform: translate(-50%, -50%) rotate(-9deg); }
+      55% { left: 56%; top: 34%; transform: translate(-50%, -50%) rotate(-5deg); }
+      100% { left: 86%; top: 73%; transform: translate(-50%, -50%) rotate(8deg); }
     }
 
     @keyframes approach-flight {
-      0% { transform: translate(26px, 0) rotate(-10deg); }
-      50% { transform: translate(380px, -44px) rotate(-2deg); }
-      100% { transform: translate(650px, 50px) rotate(5deg); }
+      0% { left: 14%; top: 56%; transform: translate(-50%, -50%) rotate(-8deg); }
+      50% { left: 54%; top: 41%; transform: translate(-50%, -50%) rotate(-2deg); }
+      100% { left: 86%; top: 63%; transform: translate(-50%, -50%) rotate(5deg); }
     }
 
     @keyframes holding-flight {
-      0% { transform: translate(34px, 0) rotate(0deg); }
-      25% { transform: translate(88px, -54px) rotate(52deg); }
-      50% { transform: translate(154px, 0) rotate(145deg); }
-      75% { transform: translate(88px, 54px) rotate(230deg); }
-      100% { transform: translate(34px, 0) rotate(320deg); }
+      0% { left: 18%; top: 40%; transform: translate(-50%, -50%) rotate(0deg); }
+      25% { left: 28%; top: 27%; transform: translate(-50%, -50%) rotate(56deg); }
+      50% { left: 39%; top: 40%; transform: translate(-50%, -50%) rotate(148deg); }
+      75% { left: 28%; top: 53%; transform: translate(-50%, -50%) rotate(238deg); }
+      100% { left: 18%; top: 40%; transform: translate(-50%, -50%) rotate(320deg); }
     }
 
     @keyframes warning-flight {
-      0%, 100% { transform: translate(140px, -22px) rotate(-4deg); }
-      25% { transform: translate(280px, -40px) rotate(-1deg); }
-      50% { transform: translate(410px, 2px) rotate(6deg); }
-      75% { transform: translate(540px, -28px) rotate(-8deg); }
+      0%, 100% { left: 24%; top: 48%; transform: translate(-50%, -50%) rotate(-4deg); }
+      25% { left: 42%; top: 36%; transform: translate(-50%, -50%) rotate(2deg); }
+      50% { left: 60%; top: 54%; transform: translate(-50%, -50%) rotate(9deg); }
+      75% { left: 78%; top: 40%; transform: translate(-50%, -50%) rotate(-10deg); }
     }
 
     @keyframes crash-flight {
-      0% { transform: translate(120px, -20px) rotate(-3deg); }
-      40% { transform: translate(400px, 12px) rotate(12deg); }
-      100% { transform: translate(610px, 126px) rotate(58deg); }
+      0% { left: 22%; top: 46%; transform: translate(-50%, -50%) rotate(-2deg); }
+      40% { left: 58%; top: 50%; transform: translate(-50%, -50%) rotate(12deg); }
+      100% { left: 82%; top: 74%; transform: translate(-50%, -50%) rotate(52deg); }
     }
 
     @keyframes smoke-rise {
-      0% { transform: translateY(0) scale(0.9); }
-      100% { transform: translateY(-26px) scale(1.18); }
+      0% { transform: translate(-72%, -50%) scale(0.82); opacity: 0.55; }
+      100% { transform: translate(-88%, -86%) scale(1.16); opacity: 0.05; }
     }
 
     @keyframes flash {
-      0%, 100% { transform: scale(0.7); opacity: 0.4; }
-      50% { transform: scale(1.4); opacity: 1; }
+      0%, 100% { transform: translate(-50%, -50%) scale(0.7); opacity: 0.4; }
+      50% { transform: translate(-50%, -50%) scale(1.4); opacity: 1; }
     }
 
     @keyframes blink {
@@ -686,21 +705,28 @@
             <div class="scene-badge" id="scene-badge">Standby</div>
           </div>
           <div class="scene-stage">
-            <svg class="flight-path" viewBox="0 0 760 250" preserveAspectRatio="none" aria-hidden="true">
-              <path d="M40 178 C170 96, 280 84, 420 120 S660 172, 720 128"></path>
-            </svg>
-            <div class="holding-ring"></div>
-            <div class="beacon"></div>
-            <div class="plane" aria-hidden="true">
-              <svg viewBox="0 0 120 64">
-                <path class="plane-body" d="M5 33 L46 26 L67 7 L77 10 L68 28 L107 25 L115 32 L107 39 L68 36 L77 54 L67 57 L46 38 L5 31 Z"></path>
-                <path class="plane-wing" d="M41 27 L63 10 L70 12 L57 29 Z"></path>
-                <path class="plane-wing" d="M41 37 L63 54 L70 52 L57 35 Z"></path>
-                <rect class="plane-accent" x="10" y="29" width="17" height="6" rx="2"></rect>
+            <div class="scene-stage-inner">
+              <svg class="flight-path" viewBox="0 0 760 250" preserveAspectRatio="none" aria-hidden="true">
+                <path d="M40 178 C170 96, 280 84, 420 120 S660 172, 720 128"></path>
               </svg>
+              <div class="holding-ring"></div>
+              <div class="beacon"></div>
+              <div class="flight-unit" aria-hidden="true">
+                <div class="smoke"></div>
+                <div class="impact"></div>
+                <div class="plane">
+                  <svg viewBox="0 0 160 80">
+                    <path class="plane-body" d="M10 42 L60 35 L91 11 L103 15 L90 38 L145 34 L154 40 L145 46 L90 42 L103 65 L91 69 L60 45 L10 38 Z"></path>
+                    <path class="plane-wing" d="M58 35 L95 12 L101 16 L73 39 Z"></path>
+                    <path class="plane-wing" d="M58 45 L95 68 L101 64 L73 41 Z"></path>
+                    <path class="plane-tail" d="M32 37 L15 24 L23 24 L42 36 Z"></path>
+                    <path class="plane-tail" d="M32 43 L15 56 L23 56 L42 44 Z"></path>
+                    <rect class="plane-accent" x="18" y="36" width="16" height="8" rx="3"></rect>
+                    <circle class="plane-window" cx="129" cy="40" r="3"></circle>
+                  </svg>
+                </div>
+              </div>
             </div>
-            <div class="smoke"></div>
-            <div class="impact"></div>
             <div class="runway"></div>
           </div>
         </div>
@@ -826,6 +852,15 @@ Select a model, run inference, and review the resulting flight case here.</pre>
       "Checking emergency priority overrides.",
       "Scoring fairness and schedule completeness."
     ];
+    const scenePreviewMap = {
+      ready: ["Ready for departure", "Start a run and the aircraft will move into an inference scene, then settle into a matching outcome case.", "Standby"],
+      inference: ["Aircraft in flight", "The aircraft is actively moving while the model evaluates constraints and priorities.", "Inference"],
+      landing: ["Smooth landing", "The run scored strongly enough to end in a clean, controlled touchdown.", "Landing"],
+      approach: ["Controlled approach", "The model is lined up well, but it still shows a little operational roughness.", "Approach"],
+      holding: ["Holding pattern", "The aircraft remains safe, but the run is indecisive enough to keep it circling.", "Holding"],
+      warning: ["Turbulence warning", "The model output is unstable enough to show a visibly unsettled approach.", "Warning"],
+      crash: ["Loss of control", "The run quality fell apart badly enough to trigger the crash case.", "Crash"]
+    };
 
     function tickClock() {
       const now = new Date();
@@ -988,6 +1023,15 @@ Select a model, run inference, and review the resulting flight case here.</pre>
     tickClock();
     window.setInterval(tickClock, 1000);
     resetTable();
+
+    const previewScene = new URLSearchParams(window.location.search).get("scene");
+    if (previewScene && scenePreviewMap[previewScene]) {
+      const [title, caption, badge] = scenePreviewMap[previewScene];
+      setScene(previewScene, title, caption, badge);
+      runMessage.textContent = `Preview mode: ${caption}`;
+      runState.textContent = "Preview";
+      logMeta.textContent = `Preview | ${previewScene}`;
+    }
   </script>
 </body>
 </html>
