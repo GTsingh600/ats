@@ -123,7 +123,7 @@ class TaskMetrics(BaseModel):
     fuel_efficiency: float = Field(default=0.0, ge=0.0, le=1.0)
     connection_impact_score: float = Field(default=0.0, ge=0.0, le=1.0)
     agent_judgment: float = Field(default=0.0, ge=0.0, le=1.0)
-    overall_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    overall_score: float = Field(default=0.0001, ge=0.0, le=1.0)
     total_delay_minutes: int = Field(default=0, ge=0)
     max_delay_minutes: int = Field(default=0, ge=0)
     estimated_fuel_burn: float = Field(default=0.0, ge=0.0)

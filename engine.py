@@ -266,7 +266,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     normalized_score *= completeness
     if conflict_count > 0:
         normalized_score *= conflict_free_ratio
-    normalized_score = max(0.0, min(1.0, normalized_score))
+    normalized_score = max(1e-4, min(1.0 - 1e-4, normalized_score))
 
     metrics = TaskMetrics(
         schedule_completeness=round(completeness, METRIC_PRECISION),

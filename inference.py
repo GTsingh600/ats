@@ -235,7 +235,7 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str, step: 
 async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> float:
     rewards: List[float] = []
     steps_taken = 0
-    score = 0.0
+    score = SCORE_EPSILON
     success = False
     runtime_model = MODEL_NAME if client is not None else "heuristic-baseline"
     log_start(task=task_id, env=BENCHMARK, model=runtime_model)
