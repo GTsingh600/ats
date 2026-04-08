@@ -125,11 +125,17 @@
       display: grid;
       grid-template-columns: 1.2fr 0.8fr;
       gap: 18px;
+      margin-bottom: 18px;
     }
 
     .panel {
       border-radius: 18px;
       padding: 22px;
+    }
+
+    .shell > .panel + .panel,
+    .shell > section.panel {
+      margin-top: 18px;
     }
 
     .section-title {
@@ -145,7 +151,15 @@
       border: 1px solid var(--line);
       border-radius: 18px;
       overflow: hidden;
-      background: linear-gradient(180deg, #13202b 0%, #1b2832 54%, #0f151b 54.5%, #141c24 100%);
+      /* Sky: deep pre-dawn navy fading toward a blue horizon */
+      background: linear-gradient(180deg,
+        #06121e 0%,
+        #0b2238 18%,
+        #12395e 42%,
+        #1a5278 62%,
+        #1e5c84 78%,
+        #225f86 100%
+      );
       position: relative;
       min-height: 330px;
     }
@@ -197,33 +211,222 @@
       inset: 0;
     }
 
-    .scene-stage::before {
-      content: "";
-      position: absolute;
-      inset: 16px;
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      border-radius: 14px;
-      pointer-events: none;
-    }
-
+    /* Horizon atmospheric glow */
     .scene-stage::after {
       content: "";
       position: absolute;
-      inset: auto 0 54px;
-      height: 1px;
-      background: rgba(255, 255, 255, 0.16);
+      left: 0; right: 0;
+      bottom: 38%;
+      height: 28px;
+      background: linear-gradient(180deg,
+        transparent 0%,
+        rgba(90, 170, 215, 0.22) 50%,
+        transparent 100%
+      );
+      filter: blur(5px);
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /* Ground plane — airport tarmac surface below the horizon */
+    .scene-ground {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 40%;
+      background: linear-gradient(180deg,
+        rgba(12, 20, 10, 0) 0%,
+        rgba(14, 22, 12, 0.72) 22%,
+        rgba(10, 18, 9, 0.96) 55%,
+        #090e08 100%
+      );
+      z-index: 1;
+      pointer-events: none;
     }
 
     .runway {
       position: absolute;
       left: 8%;
       right: 8%;
-      bottom: 28px;
-      height: 38px;
-      border-radius: 8px;
-      background:
-        linear-gradient(90deg, transparent 0%, transparent 44%, rgba(255,255,255,0.8) 44%, rgba(255,255,255,0.8) 56%, transparent 56%, transparent 100%),
-        linear-gradient(180deg, #58636d 0%, #313a44 100%);
+      bottom: 0;
+      height: 54px;
+      border-radius: 3px 3px 0 0;
+      overflow: hidden;
+      background: linear-gradient(180deg, #3d4a56 0%, #28333e 40%, #1d2830 100%);
+      z-index: 2;
+    }
+
+    /* Edge stripe lines */
+    .runway::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.80);
+      z-index: 3;
+    }
+
+    .runway::after {
+      content: '';
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 3px;
+      background: rgba(255, 255, 255, 0.80);
+      z-index: 3;
+    }
+
+    /* Runway designation number */
+    .rwy-number {
+      position: absolute;
+      left: 1.4%;
+      top: 50%;
+      transform: translateY(-50%);
+      font-family: 'Arial Narrow', Arial, sans-serif;
+      font-size: 10px;
+      font-weight: 900;
+      color: rgba(255, 255, 255, 0.50);
+      letter-spacing: 0.5px;
+      line-height: 1;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    /* Threshold line — single white stripe at the approach end */
+    .rwy-threshold {
+      position: absolute;
+      left: 5%;
+      top: 0;
+      bottom: 0;
+      width: 4px;
+      background: rgba(255, 255, 255, 0.80);
+      z-index: 2;
+    }
+
+    .rwy-threshold span { display: none; }
+
+    /* Dashed centreline */
+    .rwy-centerline {
+      position: absolute;
+      top: 50%;
+      left: 8%;
+      right: 4%;
+      height: 3px;
+      transform: translateY(-50%);
+      background: repeating-linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.82) 0px,
+        rgba(255, 255, 255, 0.82) 20px,
+        transparent 20px,
+        transparent 40px
+      );
+      z-index: 2;
+    }
+
+    /* Touchdown zone marks */
+    .rwy-tdz {
+      position: absolute;
+      top: 14%;
+      bottom: 14%;
+      left: 8%;
+      width: 7%;
+      display: flex;
+      gap: 2px;
+      z-index: 2;
+    }
+
+    .rwy-tdz span {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.60);
+      border-radius: 1px;
+    }
+
+    /* Edge light dots — top row */
+    .rwy-edge-t {
+      position: absolute;
+      top: 5px;
+      left: 3%;
+      right: 3%;
+      height: 3px;
+      background: repeating-linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.48) 0px,
+        rgba(255, 255, 255, 0.48) 3px,
+        transparent 3px,
+        transparent 26px
+      );
+      border-radius: 99px;
+      z-index: 1;
+    }
+
+    /* Edge light dots — bottom row */
+    .rwy-edge-b {
+      position: absolute;
+      bottom: 5px;
+      left: 3%;
+      right: 3%;
+      height: 3px;
+      background: repeating-linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.48) 0px,
+        rgba(255, 255, 255, 0.48) 3px,
+        transparent 3px,
+        transparent 26px
+      );
+      border-radius: 99px;
+      z-index: 1;
+    }
+
+    /* Green landing glow lights — overlay, hidden by default */
+    .rwy-glow-t,
+    .rwy-glow-b {
+      position: absolute;
+      left: 3%;
+      right: 3%;
+      height: 3px;
+      border-radius: 99px;
+      background: repeating-linear-gradient(
+        90deg,
+        rgba(121, 204, 149, 0.92) 0px,
+        rgba(121, 204, 149, 0.92) 3px,
+        transparent 3px,
+        transparent 26px
+      );
+      box-shadow: 0 0 6px rgba(121, 204, 149, 0.55);
+      opacity: 0;
+      z-index: 4;
+    }
+
+    .rwy-glow-t { top: 5px; }
+    .rwy-glow-b { bottom: 5px; }
+
+    /* Touchdown surface flash element */
+    .rwy-land-flash {
+      position: absolute;
+      inset: 0;
+      background: transparent;
+      opacity: 0;
+      z-index: 3;
+      pointer-events: none;
+    }
+
+    /* Landing scene — activate green edge lights */
+    .scene-card[data-scene="landing"] .rwy-glow-t,
+    .scene-card[data-scene="landing"] .rwy-glow-b {
+      animation: rwy-lights-on 0.7s ease-out 2.5s both;
+    }
+
+    /* Landing scene — brief touchdown flash */
+    .scene-card[data-scene="landing"] .rwy-land-flash {
+      animation: rwy-touchdown-flash 0.45s ease-out 2.3s forwards;
+    }
+
+    @keyframes rwy-lights-on {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    @keyframes rwy-touchdown-flash {
+      0%   { background: rgba(255, 255, 255, 0.22); opacity: 1; }
+      100% { background: transparent; opacity: 0; }
     }
 
     .beacon {
@@ -249,20 +452,7 @@
       opacity: 0;
     }
 
-    .flight-path {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      opacity: 0.45;
-    }
-
-    .flight-path path {
-      fill: none;
-      stroke: rgba(255, 255, 255, 0.24);
-      stroke-width: 1.8;
-      stroke-dasharray: 6 7;
-    }
+    .flight-path { display: none; }
 
     .flight-unit {
       position: absolute;
@@ -272,7 +462,7 @@
       transform: translate(-50%, -50%) rotate(-6deg);
       transform-origin: 50% 50%;
       filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
-      z-index: 2;
+      z-index: 3;
     }
 
     .plane {
@@ -376,7 +566,7 @@
     .summary-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
+      gap: 18px;
     }
 
     .mini-card,
@@ -408,6 +598,35 @@
       letter-spacing: 0.12em;
       font-family: var(--mono);
     }
+
+    /* Link cards */
+    .mini-card.links-card { display: flex; flex-direction: column; gap: 8px; }
+    .mini-card.links-card span { margin-bottom: 2px; }
+    .link-row {
+      display: flex;
+      gap: 8px;
+    }
+    .link-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 13px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.03);
+      color: var(--text);
+      text-decoration: none;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      transition: border-color 150ms, background 150ms;
+    }
+    .link-btn:hover {
+      border-color: var(--gold);
+      background: rgba(197, 166, 106, 0.08);
+      color: var(--gold);
+    }
+    .link-btn svg { flex-shrink: 0; opacity: 0.85; }
 
     .control-panel p,
     .deck-note {
@@ -477,11 +696,11 @@
     .strips {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
+      gap: 18px;
     }
 
     .strip {
-      padding: 16px;
+      padding: 18px;
       transition: border-color 180ms ease, transform 180ms ease;
     }
 
@@ -618,9 +837,10 @@
     }
 
     @keyframes landing-flight {
-      0% { left: 12%; top: 56%; transform: translate(-50%, -50%) rotate(-9deg); }
-      55% { left: 56%; top: 34%; transform: translate(-50%, -50%) rotate(-5deg); }
-      100% { left: 86%; top: 73%; transform: translate(-50%, -50%) rotate(8deg); }
+      0%   { left: 12%; top: 54%; transform: translate(-50%, -50%) rotate(-9deg); }
+      55%  { left: 56%; top: 32%; transform: translate(-50%, -50%) rotate(-5deg); }
+      85%  { left: 76%; top: 58%; transform: translate(-50%, -50%) rotate(-2deg); }
+      100% { left: 84%; top: 73%; transform: translate(-50%, -50%) rotate(3deg); }
     }
 
     @keyframes approach-flight {
@@ -718,7 +938,18 @@
                 </div>
               </div>
             </div>
-            <div class="runway"></div>
+            <div class="scene-ground" aria-hidden="true"></div>
+            <div class="runway" aria-hidden="true">
+              <div class="rwy-number">09</div>
+              <div class="rwy-threshold"><span></span><span></span><span></span><span></span><span></span><span></span></div>
+              <div class="rwy-centerline"></div>
+              <div class="rwy-tdz"><span></span><span></span></div>
+              <div class="rwy-edge-t"></div>
+              <div class="rwy-edge-b"></div>
+              <div class="rwy-glow-t"></div>
+              <div class="rwy-glow-b"></div>
+              <div class="rwy-land-flash"></div>
+            </div>
           </div>
         </div>
         <div class="ops-grid">
@@ -726,9 +957,18 @@
             <span>OpenEnv endpoints</span>
             <strong>POST /reset<br>POST /step<br>GET /state</strong>
           </div>
-          <div class="mini-card">
+          <div class="mini-card links-card">
             <span>Links</span>
-            <strong><a href="https://github.com/GTsingh600/ats" target="_blank" rel="noreferrer">GitHub</a> / <a href="https://huggingface.co/spaces/GTsingh12/ATS-openenv" target="_blank" rel="noreferrer">HF Space</a></strong>
+            <div class="link-row">
+              <a class="link-btn" href="https://github.com/GTsingh600/ats" target="_blank" rel="noreferrer">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.154-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0 1 12 6.836a9.59 9.59 0 0 1 2.504.337c1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.163 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+                GitHub
+              </a>
+              <a class="link-btn" href="https://huggingface.co/spaces/GTsingh12/ATS-openenv" target="_blank" rel="noreferrer">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zm0 2a8 8 0 1 1 0 16A8 8 0 0 1 12 4zm-1 4v4H7l5 6 5-6h-4V8h-2z"/></svg>
+                HF Space
+              </a>
+            </div>
           </div>
         </div>
       </section>
