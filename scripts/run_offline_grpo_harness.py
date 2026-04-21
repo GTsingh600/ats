@@ -1,33 +1,24 @@
-"""Offline ATC training harness for rigid server environments.
+"""Offline multi-agent ATC trainer (final server runtime path).
 
-Purpose
--------
-This is a *stability-first* runtime harness for DGX/A100 environments where:
-- internet access may be blocked,
-- model files are already cached,
-- Unsloth/vLLM are unavailable,
-- only standard torch/transformers/peft stack is allowed.
+This script is designed for rigid DGX/A100 execution:
+- fully offline (cached model files only)
+- no Unsloth
+- no vLLM
+- no live Hugging Face metadata/model lookup
 
-This script intentionally reuses existing project logic for:
-- prompt construction (`training.dataset.build_episode_dataset`)
-- reward behavior (`training.reward_functions.*`)
-
-It does NOT replace the full GRPO trainer. It is a controlled bridge to validate
-loader/runtime/training-loop stability under offline constraints.
-
-Single-command entrypoint example
----------------------------------
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python scripts/run_offline_grpo_harness.py \
-  --model Qwen/Qwen2.5-7B-Instruct --episodes 5 --max_steps 20
+It uses the *actual* ATC multi-agent environment and graders by running real
+episodes through `MultiAgentATCEnvironment.finalize()` (which computes
+composite/coordination outputs via project grading logic).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List, Optional, Tuple
 
 # Force offline behavior before importing HF/transformers modules.
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -45,20 +36,13 @@ from huggingface_hub import snapshot_download
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from training.dataset import build_episode_dataset
-from training.reward_functions import (
-    aman_reward_fn,
-    dman_reward_fn,
-    generator_reward_fn,
-    supervisor_reward_fn,
-)
-
-ROLE_TO_REWARD_FN = {
-    "AMAN": aman_reward_fn,
-    "DMAN": dman_reward_fn,
-    "GENERATOR": generator_reward_fn,
-    "SUPERVISOR": supervisor_reward_fn,
-}
+from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.generator import ChallengeGenerator
+from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+from multi_agent.models import AgentRole, SUPERVISOR_PROFILES
+from multi_agent.supervisor import SupervisorAgent
+from tasks import ordered_tasks, task_catalog
+from training.dataset import AMAN_SYSTEM, DMAN_SYSTEM, parse_aman_action, parse_dman_action
 
 
 def _resolve_model_path(model_ref: str) -> str:
@@ -86,50 +70,66 @@ def _select_dtype() -> torch.dtype:
     return torch.float16 if torch.cuda.is_available() else torch.float32
 
 
-def _build_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
+def _chat_prompt(tokenizer, system: str, user: str) -> str:
     return tokenizer.apply_chat_template(
-        messages,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
         tokenize=False,
         add_generation_prompt=True,
     )
 
 
-def _compute_reward(sample: Dict[str, Any], completion: str) -> float:
-    role = sample["agent_role"]
-    fn = ROLE_TO_REWARD_FN[role]
+def _generate_completion(
+    model,
+    tokenizer,
+    system: str,
+    user: str,
+    max_length: int,
+    max_new_tokens: int,
+) -> str:
+    prompt = _chat_prompt(tokenizer, system, user)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    return tokenizer.decode(out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
 
-    if role == "AMAN":
-        return fn(
-            [completion],
-            task_id=[sample["task_id"]],
-            supervisor_profile=[sample["supervisor_profile"]],
-            dman_slots_json=[sample.get("dman_slots_json", "[]")],
-            atfm_deadlines_json=[sample.get("atfm_deadlines_json", "{}")],
-        )[0]
 
-    if role == "DMAN":
-        return fn(
-            [completion],
-            task_id=[sample["task_id"]],
-            supervisor_profile=[sample["supervisor_profile"]],
-            aman_slots_json=[sample.get("aman_slots_json", "[]")],
-            atfm_deadlines_json=[sample.get("atfm_deadlines_json", "{}")],
-        )[0]
+def _policy_update(
+    model,
+    tokenizer,
+    optimizer,
+    system: str,
+    user: str,
+    completion: str,
+    reward: float,
+    max_length: int,
+) -> Tuple[float, float]:
+    # Train on prompt+completion sequence; reward scales gradient magnitude.
+    text = _chat_prompt(tokenizer, system, user) + completion
+    batch = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    batch = {k: v.to(model.device) for k, v in batch.items()}
 
-    if role == "GENERATOR":
-        return fn(
-            [completion],
-            task_id=[sample["task_id"]],
-            controller_scores=[float(sample.get("controller_scores", 0.5))],
-        )[0]
+    outputs = model(**batch, labels=batch["input_ids"])
+    ce_loss = outputs.loss
+    weight = max(0.1, 1.0 - reward)
+    final_loss = ce_loss * weight
 
-    # SUPERVISOR
-    return fn(
-        [completion],
-        task_id=[sample["task_id"]],
-        supervisor_profile=[sample["supervisor_profile"]],
-        merged_plan_json=[sample.get("merged_plan_json", "[]")],
-    )[0]
+    if torch.isnan(final_loss) or torch.isinf(final_loss):
+        optimizer.zero_grad(set_to_none=True)
+        return float(ce_loss.item()), float("nan")
+
+    final_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return float(ce_loss.item()), float(final_loss.item())
 
 
 def run(args: argparse.Namespace) -> None:
@@ -144,9 +144,17 @@ def run(args: argparse.Namespace) -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         local_files_only=True,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
+
+    # Avoid generation warnings for ignored sampling params in model config.
+    try:
+        model.generation_config.temperature = None
+        model.generation_config.top_p = None
+        model.generation_config.top_k = None
+    except Exception:
+        pass
 
     lora_config = LoraConfig(
         r=args.lora_rank,
@@ -159,67 +167,136 @@ def run(args: argparse.Namespace) -> None:
     model = get_peft_model(model, lora_config)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    catalog = task_catalog()
+    tasks = [t.task_id for t in ordered_tasks()]
+    if args.tasks:
+        tasks = [t.strip() for t in args.tasks.split(",") if t.strip() in catalog]
+        if not tasks:
+            raise RuntimeError("No valid task IDs provided in --tasks")
 
-    samples = build_episode_dataset(
-        n_episodes=args.episodes,
-        seed=args.seed,
-        include_generator=True,
-        include_supervisor=True,
-    )
-    if not samples:
-        raise RuntimeError("Dataset builder returned zero samples")
+    env = MultiAgentATCEnvironment(seed=args.seed)
+    generator = ChallengeGenerator(seed=args.seed)
+    supervisor = SupervisorAgent()
+    rng = random.Random(args.seed)
 
-    max_steps = min(args.max_steps, len(samples))
-    print(f"[INFO] Samples available={len(samples)} | running_steps={max_steps}")
+    print(f"[INFO] Tasks={tasks}")
+    print(f"[INFO] Episodes={args.episodes} (actual grader + actual tasks)")
 
+    global_step = 0
     model.train()
-    for step in range(max_steps):
-        sample = samples[step]
-        prompt_text = _build_prompt(tokenizer, sample["prompt"])
+    for ep in range(args.episodes):
+        task_id = tasks[ep % len(tasks)]
+        base_task = catalog[task_id]
+        profile = supervisor.sample_profile(ep)
+        sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
-        inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=args.max_length)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        if args.use_generator:
+            mutated_task, _ = generator.mutate(base_task)
+        else:
+            mutated_task = base_task
 
-        # Generation pass (eval, deterministic for stability)
-        model.eval()
-        with torch.no_grad():
-            gen = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        completion = tokenizer.decode(gen[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
-
-        reward = float(_compute_reward(sample, completion))
-        reward = max(-1.0, min(1.0, reward))
-
-        # Loss pass (train)
-        model.train()
-        outputs = model(**inputs, labels=inputs["input_ids"])
-        ce_loss = outputs.loss
-
-        # Stable scalar weight: higher reward => lower effective loss.
-        weight = max(0.1, 1.0 - reward)
-        final_loss = ce_loss * weight
-
-        if torch.isnan(final_loss) or torch.isinf(final_loss):
-            print(f"[WARN] step={step} unstable loss detected; skipping")
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
-        final_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        role = sample["agent_role"]
-        print(
-            f"step={step:03d} role={role:<10} reward={reward:+.4f} "
-            f"ce_loss={ce_loss.item():.4f} weighted_loss={final_loss.item():.4f}"
+        aman_obs, dman_obs = env.reset(
+            task_id=task_id,
+            episode_id=ep,
+            supervisor_profile=profile,
+            mutated_task=mutated_task,
         )
+        atfm = env._state.atfm_deadlines
+
+        aman_system = AMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
+        dman_system = DMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
+
+        aman_completion = _generate_completion(
+            model,
+            tokenizer,
+            aman_system,
+            aman_obs.to_prompt_text(),
+            max_length=args.max_length,
+            max_new_tokens=args.max_new_tokens,
+        )
+        aman_action = parse_aman_action(aman_completion) or _build_aman_heuristic(aman_obs)
+
+        dman_completion = _generate_completion(
+            model,
+            tokenizer,
+            dman_system,
+            dman_obs.to_prompt_text(),
+            max_length=args.max_length,
+            max_new_tokens=args.max_new_tokens,
+        )
+        dman_action = parse_dman_action(dman_completion) or _build_dman_heuristic(dman_obs, atfm)
+
+        aman_obs2, dman_obs2, _, done = env.step_bid(aman_action, dman_action)
+
+        # Optional one negotiation pass (actual environment path)
+        if not done and args.negotiate_rounds > 0:
+            aman_completion_2 = _generate_completion(
+                model,
+                tokenizer,
+                aman_system,
+                aman_obs2.to_prompt_text(),
+                max_length=args.max_length,
+                max_new_tokens=args.max_new_tokens,
+            )
+            dman_completion_2 = _generate_completion(
+                model,
+                tokenizer,
+                dman_system,
+                dman_obs2.to_prompt_text(),
+                max_length=args.max_length,
+                max_new_tokens=args.max_new_tokens,
+            )
+            aman_action_2 = parse_aman_action(aman_completion_2) or _build_aman_heuristic(aman_obs2)
+            dman_action_2 = parse_dman_action(dman_completion_2) or _build_dman_heuristic(dman_obs2, atfm)
+            env.step_negotiate(aman_action_2, dman_action_2)
+
+        result = env.finalize()
+        if args.use_generator:
+            generator.update(result.composite_score)
+
+        # Train only on AMAN/DMAN prompt+completion using actual graded rewards.
+        aman_ce, aman_w = _policy_update(
+            model,
+            tokenizer,
+            optimizer,
+            aman_system,
+            aman_obs.to_prompt_text(),
+            aman_completion,
+            reward=max(-1.0, min(1.0, float(result.aman_reward))),
+            max_length=args.max_length,
+        )
+        print(
+            f"step={global_step:03d} role={'AMAN':<10} reward={result.aman_reward:+.4f} "
+            f"ce_loss={aman_ce:.4f} weighted_loss={aman_w:.4f}"
+        )
+        global_step += 1
+
+        dman_ce, dman_w = _policy_update(
+            model,
+            tokenizer,
+            optimizer,
+            dman_system,
+            dman_obs.to_prompt_text(),
+            dman_completion,
+            reward=max(-1.0, min(1.0, float(result.dman_reward))),
+            max_length=args.max_length,
+        )
+        print(
+            f"step={global_step:03d} role={'DMAN':<10} reward={result.dman_reward:+.4f} "
+            f"ce_loss={dman_ce:.4f} weighted_loss={dman_w:.4f}"
+        )
+        global_step += 1
+
+        print(
+            f"[EP {ep:03d}] task={task_id} composite={result.composite_score:.4f} "
+            f"coord={result.per_role.coordination_score:.4f} conflicts={result.per_role.cross_lane_conflicts} "
+            f"aman={result.aman_reward:.4f} dman={result.dman_reward:.4f} "
+            f"generator={result.generator_reward:.4f} supervisor={result.supervisor_score:.4f}"
+        )
+
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            print(f"[INFO] Reached --max_steps={args.max_steps}. Stopping early.")
+            break
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -231,8 +308,11 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline ATC runtime harness (no unsloth/vllm)")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct", help="HF model id or local model path")
-    parser.add_argument("--episodes", type=int, default=5, help="Episode count for dataset generation")
-    parser.add_argument("--max_steps", type=int, default=20, help="Max optimization steps to run")
+    parser.add_argument("--episodes", type=int, default=5, help="Episode count over real ATC tasks")
+    parser.add_argument("--max_steps", type=int, default=0, help="Optional optimizer-step cap (0 = no cap)")
+    parser.add_argument("--tasks", default="", help="Comma-separated task IDs (default: all ordered tasks)")
+    parser.add_argument("--use_generator", action="store_true", help="Enable adversarial generator mutation")
+    parser.add_argument("--negotiate_rounds", type=int, default=1, help="Negotiation rounds to run (0 or 1)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=8)
