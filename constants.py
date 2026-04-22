@@ -124,4 +124,41 @@ __all__ = [
     "OUTSIDE_WINDOW_MSG_TEMPLATE",
     "PRIORITY_TOLERANCE_MSG_TEMPLATE",
     "SPACING_VIOLATION_MSG_TEMPLATE",
+    # Multi-agent constants
+    "AMAN_EMERGENCY_DELAY_TOLERANCE",
+    "DMAN_EMERGENCY_DELAY_TOLERANCE",
+    "ATFM_DEADLINE_BUFFER_MINUTES",
+    "CROSS_LANE_CONFLICT_PENALTY",
+    "THEORY_OF_MIND_BONUS",
+    "GENERATOR_ESCALATION_THRESHOLD",
+    "GENERATOR_FLOOR_THRESHOLD",
+    "COORDINATION_SCORE_WEIGHTS",
 ]
+
+
+# ============================================================================
+# Multi-Agent AMAN/DMAN Constants
+# ============================================================================
+
+# Emergency delay tolerances per role (minutes)
+AMAN_EMERGENCY_DELAY_TOLERANCE: int = 5   # EMERGENCY arrival must land within 5 min of window
+DMAN_EMERGENCY_DELAY_TOLERANCE: int = 5   # EMERGENCY departure must push within 5 min
+
+# ATFM network slot buffer: realistic GDP margin (minutes)
+ATFM_DEADLINE_BUFFER_MINUTES: int = 12
+
+# Reward shaping constants
+CROSS_LANE_CONFLICT_PENALTY: float = 0.15  # per conflict between AMAN/DMAN slots
+THEORY_OF_MIND_BONUS: float = 0.25         # pre-emptive coordination without prompt
+
+# Generator adaptive curriculum thresholds
+GENERATOR_ESCALATION_THRESHOLD: float = 0.65  # escalate when agents score above this
+GENERATOR_FLOOR_THRESHOLD: float = 0.30        # ease when agents score below this
+
+# Coordination score component weights
+COORDINATION_SCORE_WEIGHTS = {
+    "zero_cross_conflicts": 0.25,
+    "negotiation_efficiency": 0.20,  # 0 rounds=0.20, 1 round=0.10, 2+=0.0
+    "emergency_handling": 0.30,
+    "preemptive_gap": 0.25,
+}

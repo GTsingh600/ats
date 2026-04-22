@@ -21,11 +21,32 @@ dev = [
     "pytest>=8.4.0",
     "requests>=2.33.0",
 ]
+training = [
+    "trl>=0.9.6",
+    "datasets>=2.20.0",
+    "transformers>=4.43.0",
+    "torch>=2.3.0",
+    "accelerate>=0.32.0",
+    "bitsandbytes>=0.43.0",
+    "peft>=0.12.0",
+    "matplotlib>=3.9.0",
+    "numpy>=1.26.0",
+]
+training-unsloth = [
+    "unsloth[colab-new]>=2024.8",
+    "trl>=0.9.6",
+    "datasets>=2.20.0",
+    "matplotlib>=3.9.0",
+    "numpy>=1.26.0",
+]
 
 [project.scripts]
 server = "atc_env.server.app:main"
+atc-train = "training.train_grpo:main"
+atc-eval = "training.eval:main"
+atc-plot = "training.plot_rewards:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["atc_env", "atc_env.server"]
-package-dir = { "atc_env" = ".", "atc_env.server" = "server" }
+packages = ["atc_env", "atc_env.server", "atc_env.multi_agent", "atc_env.training"]
+package-dir = { "atc_env" = ".", "atc_env.server" = "server", "atc_env.multi_agent" = "multi_agent", "atc_env.training" = "training" }

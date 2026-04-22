@@ -297,3 +297,67 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         recommendations=recommendations[:MAX_RECOMMENDATIONS],
         normalized_score=normalized_score,
     )
+
+
+def per_role_metrics(
+    task: TaskDefinition,
+    proposal: Iterable[SlotAssignment],
+    outcome: SimulationOutcome,
+) -> Dict:
+    """Extract AMAN/DMAN split metrics from a simulation outcome.
+
+    Returns plain dict for lightweight use in reward functions.
+    Arrivals → AMAN. Departures → DMAN.
+    """
+    from models import OperationType, PriorityClass
+
+    flights_by_id = {f.flight_id: f for f in task.flights}
+    assignment_map = {a.flight_id: a for a in proposal}
+
+    arr_delays: List[int] = []
+    dep_delays: List[int] = []
+    emg_arr_ok = emg_arr_miss = 0
+    emg_dep_ok = emg_dep_miss = 0
+
+    for fid, slot in assignment_map.items():
+        flight = flights_by_id.get(fid)
+        if not flight:
+            continue
+        delay = abs(slot.assigned_minute - flight.scheduled_minute)
+        is_emg = flight.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+
+        if flight.operation == OperationType.ARRIVAL:
+            arr_delays.append(delay)
+            if is_emg:
+                if delay <= 5:
+                    emg_arr_ok += 1
+                else:
+                    emg_arr_miss += 1
+        else:
+            dep_delays.append(delay)
+            if is_emg:
+                if delay <= 5:
+                    emg_dep_ok += 1
+                else:
+                    emg_dep_miss += 1
+
+    total_arrivals   = sum(1 for f in task.flights if f.operation == OperationType.ARRIVAL)
+    total_departures = sum(1 for f in task.flights if f.operation == OperationType.DEPARTURE)
+
+    return {
+        "arrival_count":               total_arrivals,
+        "departure_count":             total_departures,
+        "arrival_delay_total":         sum(arr_delays),
+        "arrival_delay_mean":          sum(arr_delays) / max(1, len(arr_delays)),
+        "arrivals_assigned":           len(arr_delays),
+        "arrivals_missing":            total_arrivals - len(arr_delays),
+        "departure_delay_total":       sum(dep_delays),
+        "departure_delay_mean":        sum(dep_delays) / max(1, len(dep_delays)),
+        "departures_assigned":         len(dep_delays),
+        "departures_missing":          total_departures - len(dep_delays),
+        "emergency_arrivals_ok":       emg_arr_ok,
+        "emergency_arrivals_missed":   emg_arr_miss,
+        "emergency_departures_ok":     emg_dep_ok,
+        "emergency_departures_missed": emg_dep_miss,
+        "total_conflict_count":        outcome.metrics.conflict_count,
+    }

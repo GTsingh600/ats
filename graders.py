@@ -324,6 +324,130 @@ class LLMSupervisorGrader(BaseTaskGrader):
         )
 
 
+# ── Multi-Agent Coordination Grader ──────────────────────────────────────────
+
+class MultiAgentCoordinationGrader:
+    """Grades quality of AMAN/DMAN coordination in multi-agent episodes.
+
+    Scores four coordination dimensions independently:
+      1. Cross-lane conflict avoidance  — did shared-runway conflicts occur?
+      2. Emergency handling quality     — were EMERGENCY/MEDICAL flights handled first?
+      3. Negotiation efficiency         — how many rounds needed to resolve conflicts?
+      4. Theory-of-mind bonus           — did agents pre-emptively coordinate?
+
+    This grader is auxiliary (not part of official benchmark composite) but
+    used directly in per-agent reward functions during GRPO training.
+    """
+
+    grader_name = "multi_agent_coordination"
+
+    def grade(
+        self,
+        task: TaskDefinition,
+        outcome: SimulationOutcome,
+        aman_slots: List[SlotAssignment],
+        dman_slots: List[SlotAssignment],
+        negotiation_rounds: int = 0,
+        preemptive_yield: bool = False,
+    ) -> TaskGrade:
+        score = 0.0
+        sub_scores: Dict[str, float] = {}
+        rationale_parts: List[str] = []
+
+        # 1. Cross-lane conflict avoidance
+        aman_runway_set = {s.runway for s in aman_slots}
+        dman_runway_set = {s.runway for s in dman_slots}
+        shared_runways = aman_runway_set & dman_runway_set
+
+        if not shared_runways:
+            cross_score = 1.0
+            rationale_parts.append("Agents used segregated runways — no cross-lane conflict possible.")
+        else:
+            cross_conflicts = outcome.metrics.conflict_count
+            cross_score = max(0.0, 1.0 - cross_conflicts * 0.25)
+            if cross_conflicts == 0:
+                rationale_parts.append(f"Zero conflicts on {len(shared_runways)} shared runway(s).")
+            else:
+                rationale_parts.append(f"{cross_conflicts} conflict(s) on shared runways.")
+
+        sub_scores["cross_lane_avoidance"] = round(cross_score, 4)
+        score += 0.25 * cross_score
+
+        # 2. Emergency handling quality
+        emergency_flights = [
+            f for f in task.flights
+            if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        ]
+        all_slots = {s.flight_id: s for s in aman_slots + dman_slots}
+        if emergency_flights:
+            emg_score_val = 0.0
+            for f in emergency_flights:
+                slot = all_slots.get(f.flight_id)
+                if slot:
+                    delay = abs(slot.assigned_minute - f.scheduled_minute)
+                    emg_score_val += 1.0 if delay <= 5 else max(0.0, 1.0 - delay / 10.0)
+            emg_score = emg_score_val / len(emergency_flights)
+            rationale_parts.append(
+                f"Emergency handling: {emg_score:.2f} across {len(emergency_flights)} priority flight(s)."
+            )
+        else:
+            emg_score = 1.0
+            rationale_parts.append("No emergency flights in scenario.")
+
+        sub_scores["emergency_handling"] = round(emg_score, 4)
+        score += 0.30 * emg_score
+
+        # 3. Negotiation efficiency
+        if negotiation_rounds == 0:
+            neg_score = 1.0
+            rationale_parts.append("Coordination achieved in bid round (0 negotiation rounds).")
+        elif negotiation_rounds == 1:
+            neg_score = 0.6
+            rationale_parts.append("Coordination required 1 negotiation round.")
+        else:
+            neg_score = max(0.0, 0.4 - 0.15 * (negotiation_rounds - 2))
+            rationale_parts.append(f"Coordination required {negotiation_rounds} negotiation rounds.")
+
+        sub_scores["negotiation_efficiency"] = round(neg_score, 4)
+        score += 0.20 * neg_score
+
+        # 4. Theory-of-mind / pre-emptive coordination bonus
+        tom_score = 1.0 if preemptive_yield else 0.0
+        if preemptive_yield:
+            rationale_parts.append("Theory-of-mind bonus: agent pre-emptively yielded before conflict detected.")
+        sub_scores["theory_of_mind"] = round(tom_score, 4)
+        score += 0.25 * tom_score
+
+        return TaskGrade(
+            grader_name=self.grader_name,
+            score=round(max(0.01, min(0.99, score)), 4),
+            rationale=" | ".join(rationale_parts),
+            sub_scores=sub_scores,
+        )
+
+
+def grade_multi_agent(
+    task: TaskDefinition,
+    outcome: SimulationOutcome,
+    aman_slots: List[SlotAssignment],
+    dman_slots: List[SlotAssignment],
+    aman_rationale: str = "",
+    dman_rationale: str = "",
+    negotiation_rounds: int = 0,
+    preemptive_yield: bool = False,
+) -> List[TaskGrade]:
+    """Grade a multi-agent episode. Returns [composite, coordination, llm_supervisor]."""
+    merged = aman_slots + dman_slots
+    combined_rationale = f"AMAN: {aman_rationale} | DMAN: {dman_rationale}"
+
+    composite    = GatedCompositeGrader().grade(task, outcome, merged, combined_rationale)
+    coordination = MultiAgentCoordinationGrader().grade(
+        task, outcome, aman_slots, dman_slots, negotiation_rounds, preemptive_yield
+    )
+    llm          = LLMSupervisorGrader().grade(task, outcome, merged, combined_rationale)
+    return [composite, coordination, llm]
+
+
 # ── Public Entry Point ────────────────────────────────────────────────────────
 
 def grade_task(

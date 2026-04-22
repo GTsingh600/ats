@@ -5,205 +5,255 @@ app_port: 8000
 license: mit
 tags:
   - openenv
+  - multi-agent
+  - grpo
+  - air-traffic-control
 ---
 
 ![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-blue)
 ![Tasks](https://img.shields.io/badge/tasks-4-green)
+![Modes](https://img.shields.io/badge/modes-single%20%2B%20multi--agent-orange)
 ![HF Space](https://img.shields.io/badge/HF%20Space-live-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 # ATC Optimization OpenEnv
 
-A real-world OpenEnv benchmark for **air traffic disruption recovery**. The agent acts as a tactical ATC/flow controller and must build safe, complete runway slot plans under operational pressure (weather, inspections, emergency priorities, bank balancing).
+A real-world OpenEnv benchmark for air traffic disruption recovery.
+
+The repository now ships two complementary modes:
+
+- A validated single-agent OpenEnv benchmark with deterministic grading, dense rewards, and a strong heuristic baseline in `inference.py`
+- A multi-agent AMAN/DMAN coordination stack with adversarial task mutation, rotating supervisor preferences, and GRPO training utilities under `multi_agent/` and `training/`
+
+The single-agent path is the current submission-ready baseline. The multi-agent path is the coordination/research/training track and is also exposed through the FastAPI app.
 
 ## Judge Quick View
 
 | Item | Detail |
-|------|--------|
-| Domain | ATC disruption recovery (real-world, not a game) |
-| OpenEnv API | Typed Pydantic models + `/reset` `/step` `/state` |
-| Tasks | 4 deterministic graded tasks (easy → medium → hard × 2) |
-| Graders | 3-layer gated composite score, strictly bounded 0.0–1.0 |
-| Baseline | Root `inference.py`, structured `[START]/[STEP]/[END]` logs |
-| Benchmark | See `BENCHMARK.md` — agent vs. random baseline across all 4 tasks |
-| Tests | `pytest -q` passes green |
-| Infra | Dockerfile + HF Space: https://huggingface.co/spaces/GTsingh12/ATS-openenv |
-| Architecture | Mermaid diagram in Environment Design section below |
+|---|---|
+| Domain | Real ATC disruption recovery, not a game |
+| Modes | Single-agent OpenEnv + multi-agent AMAN/DMAN coordination |
+| Tasks | 4 deterministic tasks spanning easy to hard |
+| Grading | 3-layer gated composite score with strict `(0, 1)` outputs |
+| Multi-agent extras | Generator curriculum, supervisor profiles, coordination grading |
+| Baselines | Root `inference.py` and `multi_agent/inference.py` |
+| Training | GRPO dataset builder, reward functions, train/eval scripts |
+| Validation | `pytest -q`, `scripts/run_graders.py`, OpenEnv validation, local checklist |
+| Space | https://huggingface.co/spaces/GTsingh12/ATS-openenv |
+
+## What Is In This Repo
+
+### Single-Agent Benchmark
+
+The classic OpenEnv mode asks one agent to submit a full runway-slot plan for a task. The environment returns diagnostics, dense reward shaping, and deterministic grader output.
+
+Core path:
+
+- `server/atc_environment.py`
+- `engine.py`
+- `graders.py`
+- `planner.py`
+- `inference.py`
+
+### Multi-Agent Coordination Stack
+
+The multi-agent mode splits control into:
+
+- `AMAN`: Arrival Manager
+- `DMAN`: Departure Manager
+- `GENERATOR`: adversarial self-play scenario mutator
+- `SUPERVISOR`: rotating preference profile that changes what "good" means episode to episode
+
+Protocol:
+
+1. `BID`: AMAN and DMAN propose independently
+2. `NEGOTIATE`: conflicts and emergency broadcasts are exchanged
+3. `FINAL`: merged plan is graded and per-role rewards are computed
+
+Important runtime behavior:
+
+- `multi_agent/inference.py` uses mutated tasks by default
+- pass `--no_generator` to run on the original base task without mutations
+- the environment uses the mutated task for the episode whenever one is supplied
+
+## Architecture
+
+### Single-Agent
 
 ```mermaid
 graph LR
-    A[LLM Agent] -->|ATCOptimizationAction| B[OpenEnv step API]
-    B --> C[ATC Environment\nserver/atc_environment.py]
-    C --> D[Simulation Engine\nengine.py]
-    D --> E[Grader\ngraders.py]
-    E -->|reward 0.0–1.0| F[Observation + Score]
-    F -->|next observation| A
-    C --> G[State\nstate API]
-    G -->|active_task_ids,\nflight states| A
+    A[Single Agent] -->|ATCOptimizationAction| B[OpenEnv step API]
+    B --> C[ATCOptimizationEnvironment]
+    C --> D[Simulation Engine]
+    D --> E[Gated Graders]
+    E --> F[Observation + Reward]
+    C --> G[/state]
 ```
 
-**Why this is hard for an LLM:** A naive agent that assigns all slots sequentially scores approximately 0.2 on the medium task because it ignores wake turbulence separation minimums between Heavy/Medium/Light aircraft classes. The grader's 3-layer gate requires the agent to satisfy all hard safety constraints before any efficiency or fairness credit is awarded. The agent must simultaneously reason about separation rules, emergency priority overrides (medical/fuel emergencies jump the queue), airline equity across the bank window, and runway capacity — making this a genuine multi-objective planning problem.
+### Multi-Agent
 
-## Live Space Preview
+```mermaid
+graph LR
+    A[AMAN] -->|arrival slots + messages| E[MultiAgentATCEnvironment]
+    B[DMAN] -->|departure slots + messages| E
+    C[GENERATOR] -->|task mutation| E
+    D[SUPERVISOR] -->|preference profile| E
+    E --> F[simulate_plan]
+    F --> G[composite + coordination + supervisor grading]
+    G --> H[per-role rewards]
+```
 
-Screenshot from the deployed Hugging Face Space:
+## Tasks
 
-![ATC Optimization OpenEnv Space UI](assets/hf-space-console-live.png)
+Defined in `tasks.py`.
 
-## Requirement-to-Evidence Matrix
+| Task ID | Title | Difficulty | Flights | Runways | Notes |
+|---|---|---|---:|---:|---|
+| `delhi_monsoon_recovery_easy` | Delhi Monsoon Departure Recovery | Easy | 10 | 2 | Includes light aircraft wake-spacing edge cases |
+| `mumbai_bank_balance_medium` | Mumbai Hub Bank Balance | Medium | 14 | 2 | Mixed passenger/cargo bank balancing under disruption |
+| `bengaluru_irrops_hard` | Bengaluru IRROPS Recovery Command | Hard | 18 | 2 | Emergency arrival, medical departure, ATFM deadlines |
+| `hyderabad_cargo_crunch_medium_hard` | Hyderabad Single-Runway Cargo Crunch | Hard | 7 | 1 | Single-runway wake asymmetry puzzle |
 
-| Requirement | Evidence |
-|---|---|
-| Real-world utility | `tasks.py` models real ATC disruption scenarios with safety and fairness constraints |
-| Full OpenEnv spec | `openenv.yaml`, typed Pydantic models in `models.py`, server endpoints in `server/app.py` |
-| 3+ tasks with graders | 4 tasks in `tasks.py`; 3-layer gated composite + auxiliary LLM grading in `graders.py` |
-| Meaningful reward shaping | Potential-based dense step-wise reward in `server/atc_environment.py` via `engine.py` simulation |
-| Reproducible baseline | Root `inference.py` with deterministic fallback + strict stdout format |
-| Docker + Space deployability | `Dockerfile`, `scripts/deploy_hf_space.py`, `scripts/validate-submission.sh` |
-| Validation workflow | `python -m openenv.cli validate .`, `python scripts/run_graders.py`, `python inference.py` |
+All four tasks include Heavy, Medium, and Light wake classes to exercise the full asymmetric separation matrix.
 
-## Environment Design
+## Scoring
 
-### Action Space
-`ATCOptimizationAction` in `models.py`
+### Single-Agent Official Score
 
-- `proposal`: list of `SlotAssignment`
-- `rationale`: reasoning summary
-- `commit`: finish episode flag
+`graders.py` implements a 3-layer gated design:
 
-Each `SlotAssignment` includes:
+1. `SafetyGateEvaluator`
+2. `PriorityRubricGrader`
+3. `EfficiencyRubricGrader`
 
-- `flight_id`
-- `runway`
-- `assigned_minute`
-- `hold_minutes`
+Official score:
 
-### Observation Space
-`ATCOptimizationObservation` in `models.py`
+```text
+min(gate_ceiling, 0.30 * priority_score + 0.70 * efficiency_score)
+```
 
-- task metadata and briefing
-- flight and runway state
-- current and best metrics
-- diagnostics and recommendations
-- grader feedback
-- `steps_remaining`
+The score is always clamped to the strict open interval `(0, 1)`.
 
-### State Space
-`ATCOptimizationState` exposed by `/state`
+### Multi-Agent Outputs
 
-- includes `active_task_ids` so tasks are enumerable by validators/agents
+`grade_multi_agent(...)` returns:
 
-## Tasks and Difficulty
+- `composite_task_grader`
+- `multi_agent_coordination`
+- `llm_supervisor`
 
-Defined in `tasks.py`:
+The multi-agent environment also computes:
 
-1. `delhi_monsoon_recovery_easy` — Delhi monsoon departure recovery (easy, 10 flights, 2 runways)
-2. `mumbai_bank_balance_medium` — Mumbai hub bank balance (medium, 13 flights, 2 runways)
-3. `bengaluru_irrops_hard` — Bengaluru IRROPS recovery command (hard, 17 flights, 2 runways)
-4. `hyderabad_cargo_crunch_medium_hard` — Single-runway cargo crunch (hard, 7 flights, 1 runway)
+- `aman_reward`
+- `dman_reward`
+- `generator_reward`
+- `supervisor_score`
+- per-role coordination and conflict metrics
 
-All tasks include all three wake turbulence classes (Heavy, Medium, Light) to exercise asymmetric separation rules. All tasks are scored with deterministic and strictly bounded outputs (`0.0 < score < 1.0`).
+## Reward Shaping
 
-## Grading Architecture
+### Single-Agent
 
-Three-layer gated design in `graders.py`:
+In `server/atc_environment.py`:
 
-| Layer | Component | Role |
-|---|---|---|
-| 1 | `SafetyGateEvaluator` | Hard constraint gates — separation conflicts, incomplete schedule, emergency violations cap score ceiling |
-| 2 | `PriorityRubricGrader` | Grades emergency/medical/connection prioritization quality (50% emergency + 30% medical + 20% connection) |
-| 3 | `EfficiencyRubricGrader` | Grades delay (35%), fuel (25%), fairness (20%), connection impact (20%) |
-| Final | `GatedCompositeGrader` | Official score = `min(gate_ceiling, 0.30 × priority + 0.70 × efficiency)` clamped to strict `(0, 1)` |
+- reward is potential-based: `current_score - previous_score`
+- this gives dense feedback without changing the optimal policy target
 
-Auxiliary `LLMSupervisorGrader` runs independently as a side-channel and does NOT contribute to the official composite score.
+### Multi-Agent
 
-## Reward and Scoring
+In `multi_agent/environment.py` and `training/reward_functions.py`:
 
-Operational score components in `engine.py`:
-
-- completeness (24%)
-- conflict-free ratio (24%)
-- priority handling (18%)
-- delay efficiency (16%)
-- fairness (10%)
-- fuel efficiency (8%)
-
-Reward behavior:
-
-- first valid submission receives full score as reward
-- subsequent steps receive potential-based incremental reward (current − previous)
-- invalid/incomplete/conflicting plans are penalized via safety gates
-
-Official submission score is the deterministic gated composite grading from `graders.py`.
+- AMAN and DMAN receive role-specific rewards
+- cross-lane conflicts are penalized
+- emergency handling is rewarded
+- coordination quality and theory-of-mind behavior are rewarded
+- the generator is adversarial but penalized for unsolvable scenarios
 
 ## Wake Turbulence Separation Matrix
 
-| Leader → Follower | Heavy | Medium | Light |
-|---|---|---|---|
-| **Heavy** | 4 min | 5 min | 6 min |
-| **Medium** | 3 min | 3 min | 4 min |
-| **Light** | 3 min | 3 min | 3 min |
+Defined in `constants.py` and used by both planners and the simulator.
 
-Defined in `constants.py` and used by both `engine.py` and `planner.py`.
+| Leader -> Follower | Heavy | Medium | Light |
+|---|---:|---:|---:|
+| Heavy | 4 | 5 | 6 |
+| Medium | 3 | 3 | 4 |
+| Light | 3 | 3 | 3 |
 
-## Baseline Inference (Submission Script)
+## Current Baselines
+
+### Single-Agent Baseline
 
 Root file: `inference.py`
 
-- uses OpenAI client interface
-- reads `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`
-- emits strict structured logs:
-  - `[START] task=<id> env=atc_optimization_openenv model=<model>`
-  - `[STEP] step=<n> action=<action> reward=<0.00> done=<true|false> error=<msg|null>`
-  - `[END] task=<id> success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>`
-- deterministic fallback when model output is unavailable/invalid
-- all scores strictly within `(0, 1)` — never exactly 0.0 or 1.0
+- structured logging with `[START]`, `[STEP]`, `[END]`
+- OpenAI-compatible API support through HF Router or compatible backends
+- deterministic fallback when no model output is available
+- root baseline currently runs 3 tasks to stay within the benchmark runtime budget:
+  - `delhi_monsoon_recovery_easy`
+  - `mumbai_bank_balance_medium`
+  - `bengaluru_irrops_hard`
 
-### Tasks Run by Inference
+### Multi-Agent Baseline
 
-The baseline inference script runs the following 3 tasks:
+Entry point: `multi_agent/inference.py`
 
-- `delhi_monsoon_recovery_easy`
-- `mumbai_bank_balance_medium`
-- `bengaluru_irrops_hard`
+- supports heuristic baseline mode with no LLM
+- supports OpenAI-compatible model calls when `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` are set
+- runs mutated tasks by default through `ChallengeGenerator`
+- supports `--no_generator` for fixed base-task runs
+- supports `--all_tasks` for all 4 tasks
 
-The 4th task (`hyderabad_cargo_crunch_medium_hard`) is available via the environment API but not included in the baseline inference to stay within the 20-minute runtime limit.
+The multi-agent stack is intentionally harder and is currently better viewed as the training/demo path than the strongest benchmark submission path.
 
 ## Repository Layout
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `models.py` | Typed Pydantic contracts (Action, Observation, State, domain models) |
-| `tasks.py` | Scenario catalog — 4 task definitions with flights, runways, budgets |
-| `engine.py` | Deterministic simulation + metric computation + reward shaping |
-| `graders.py` | 3-layer gated graders + auxiliary LLM grader |
-| `planner.py` | Deterministic heuristic + refinement baseline planner |
-| `constants.py` | Centralized constants (wake separation, weights, precision, thresholds) |
-| `client.py` | OpenEnv client wrapper for agent-side usage |
-| `imports.py` | Import utilities for relative/absolute compatibility |
-| `server/app.py` | FastAPI/OpenEnv entrypoint via `create_app()` |
-| `server/atc_environment.py` | `Environment` implementation — reset, step, state |
-| `inference.py` | Required baseline submission script (root) |
-| `openenv.yaml` | OpenEnv environment metadata |
-| `BENCHMARK.md` | Judge-facing benchmark summary with task-by-task comparison table |
-| `results/benchmark_scores.json` | Placeholder runtime/score artifact to fill after running `python inference.py` |
-| `Dockerfile` | Container runtime for HF Space deployment |
-| `pyproject.toml` | Python project config and dependencies |
-| `scripts/run_graders.py` | Task grading check with strict `(0, 1)` assertions |
-| `scripts/ping_env.py` | Deployment health/reset ping |
-| `scripts/validate-submission.sh` | Judge-style full validator |
-| `scripts/pre_submission_validate.sh` | Convenience pre-submission wrapper |
-| `scripts/deploy_hf_space.py` | HF API deployment helper |
-| `tests/` | pytest suite (grader contracts, env integration, inference, constants) |
+| `models.py` | Single-agent contracts and domain models |
+| `tasks.py` | Scenario catalog and task briefing generation |
+| `engine.py` | Deterministic simulation and metric computation |
+| `graders.py` | Composite, coordination, and supervisor graders |
+| `planner.py` | Deterministic heuristic and refinement planner |
+| `constants.py` | Shared scoring, separation, and multi-agent constants |
+| `client.py` | OpenEnv client wrapper |
+| `inference.py` | Single-agent baseline runner |
+| `multi_agent/models.py` | AMAN/DMAN/generator/supervisor contracts |
+| `multi_agent/environment.py` | Multi-agent environment and per-role rewards |
+| `multi_agent/generator.py` | Adversarial task mutation and curriculum |
+| `multi_agent/supervisor.py` | Rotating supervisor preference profiles |
+| `multi_agent/inference.py` | Multi-agent heuristic/LLM episode runner |
+| `training/dataset.py` | GRPO dataset builder and output parsers |
+| `training/reward_functions.py` | Role-specific GRPO reward functions |
+| `training/train_grpo.py` | Multi-agent GRPO training entry point |
+| `training/eval.py` | Before/after training evaluation |
+| `server/app.py` | FastAPI/OpenEnv app + UI + multi-agent endpoints |
+| `server/atc_environment.py` | Single-agent OpenEnv environment |
+| `openenv.yaml` | OpenEnv metadata including multi-agent declarations |
+| `BENCHMARK.md` | Judge-facing single-agent benchmark summary |
+| `scripts/run_graders.py` | Deterministic grader smoke check |
+| `scripts/run_local_checklist.ps1` | End-to-end local validation script |
+| `tests/` | 46 automated tests covering single-agent and multi-agent paths |
 
 ## Setup
 
+### Core Environment
+
 ```bash
 pip install uv
-uv sync
+uv sync --extra dev
 ```
 
-## Required Environment Variables
+### Training Extras
+
+```bash
+uv sync --extra dev --extra training
+```
+
+If you want the Colab/Unsloth route, install the training extras plus the dependencies noted in `training/train_grpo.py`.
+
+## Environment Variables
+
+The OpenAI-compatible paths use:
 
 ```bash
 export API_BASE_URL="https://router.huggingface.co/v1"
@@ -211,39 +261,107 @@ export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
 export HF_TOKEN="your-secret-token"
 ```
 
-Note: use `python inference.py` (script) or `python -m inference` (module), not `python -m inference.py`.
+PowerShell equivalent:
+
+```powershell
+$env:API_BASE_URL="https://router.huggingface.co/v1"
+$env:MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+$env:HF_TOKEN="your-secret-token"
+```
 
 ## Local Runbook
 
-Start server:
+### Start the Server
 
 ```bash
-uvicorn server.app:app --host 0.0.0.0 --port 8000
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Run OpenEnv validation:
+### Validate the OpenEnv Package
 
 ```bash
 python -m openenv.cli validate .
 ```
 
-Run all graders:
+### Run Tests
+
+```bash
+python -m pytest -q
+```
+
+### Run Grader Smoke Checks
 
 ```bash
 python scripts/run_graders.py
 ```
 
-Run baseline inference:
+### Run Single-Agent Baseline
 
 ```bash
 python inference.py
 ```
 
-Run tests:
+### Run Multi-Agent Baseline
+
+Heuristic mode:
 
 ```bash
-uv run pytest -q
+python multi_agent/inference.py --all_tasks --episodes 1
 ```
+
+Fixed tasks without generator mutations:
+
+```bash
+python multi_agent/inference.py --all_tasks --episodes 1 --no_generator
+```
+
+LLM-backed multi-agent run:
+
+```bash
+python multi_agent/inference.py --model "$MODEL_NAME" --all_tasks --episodes 1
+```
+
+### Run the Local Checklist
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_local_checklist.ps1
+```
+
+## Multi-Agent HTTP Endpoints
+
+The FastAPI app also exposes multi-agent helpers:
+
+- `POST /multi_agent/reset`
+- `POST /multi_agent/step/bid`
+- `POST /multi_agent/finalize`
+- `POST /multi_agent/episode`
+- `GET /multi_agent/profiles`
+- `GET /multi_agent/status`
+
+These sit alongside the normal OpenEnv endpoints and the UI routes.
+
+## Training
+
+### Build Dataset + Train with GRPO
+
+```bash
+python training/train_grpo.py --episodes 200 --output_dir ./outputs/atc-multiagent
+```
+
+For Google Colab, use the notebook at `training/atc_multiagent_colab.ipynb`.
+
+### Evaluate a Trained Checkpoint
+
+```bash
+python training/eval.py --base heuristic-baseline --trained ./outputs/atc-multiagent --episodes 10
+```
+
+Training design highlights:
+
+- one base model, multiple roles via system prompts
+- GRPO instead of PPO to reduce memory cost
+- adaptive curriculum through `ChallengeGenerator`
+- supervisor-alignment shaping through rotating profile preferences
 
 ## Docker
 
@@ -263,18 +381,16 @@ docker run --rm -p 8000:8000 atc-openenv
 
 ### Option A: Manual
 
-1. Create HF Space with SDK = Docker
-2. Push repository
+1. Create a Hugging Face Space with SDK = Docker
+2. Push this repository
 3. Set secrets: `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`
-4. Ping deployment:
+4. Ping the deployment:
 
 ```bash
 python scripts/ping_env.py https://<your-space>.hf.space
 ```
 
-### Option B: HF API Helper
-
-Token-only template is provided in `.env.hf_space.example`.
+### Option B: Helper Script
 
 ```bash
 export HF_TOKEN="hf_xxx"
@@ -288,30 +404,19 @@ Then validate:
 ./scripts/validate-submission.sh "https://<owner>-<space-name>.hf.space" .
 ```
 
-## Pre-Submission Checklist
+## Validation Status
 
-Run all before final submission:
+The current repository state validates cleanly on the local test/benchmark surface:
 
-```bash
-python -m openenv.cli validate .
-uv run pytest -q
-python scripts/run_graders.py
-python inference.py
-./scripts/validate-submission.sh https://<your-space>.hf.space .
-```
-
-Expected:
-
-- OpenEnv validate: `[OK] : Ready for multi-mode deployment`
-- All grader scores strictly bounded `(0.0, 1.0)` — never exactly 0 or 1
-- Inference logs strictly follow `[START]/[STEP]/[END]` format
-- Space responds to `/health` and `/reset`
+- `python -m pytest -q`
+- `python scripts/run_graders.py`
+- `python inference.py`
+- `python multi_agent/inference.py --all_tasks --episodes 1`
 
 ## Notes for Judges
 
-- **Deterministic scoring** is intentional for reproducibility and anti-gaming
-- **3-layer gated architecture**: safety gates enforce hard ceilings (conflicts → max 0.40, missing → max 0.50, emergency violation → max 0.35) that cannot be compensated by good efficiency
-- **Strict `(0, 1)` bounds**: `_strict_score()` with ε=1e-4 guarantees no boundary values reach exactly 0.0 or 1.0
-- **Optional LLM signals** are preserved as auxiliary analysis, not official score drivers
-- **4 tasks with 3 wake classes**: all tasks include Heavy, Medium, and Light aircraft exercising the full asymmetric wake turbulence separation matrix
-- **Potential-based reward shaping** (Ng et al. 1999) ensures policy-gradient-safe dense rewards
+- Deterministic scoring is intentional for reproducibility and anti-gaming
+- Safety gates cap the score and cannot be compensated away by efficiency
+- All tasks exercise asymmetric wake turbulence logic across Heavy, Medium, and Light aircraft
+- The single-agent path is the strongest validated benchmark baseline
+- The multi-agent stack demonstrates coordination, self-play generation, rotating supervisor preferences, and GRPO-ready training infrastructure inside the same benchmark repo
