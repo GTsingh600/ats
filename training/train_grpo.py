@@ -774,16 +774,27 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ATC Multi-Agent GRPO Training")
-    parser.add_argument("--model",        default=DEFAULT_MODEL)
-    parser.add_argument("--output_dir",   default=DEFAULT_OUTPUT)
-    parser.add_argument("--episodes",     type=int, default=200)
-    parser.add_argument("--lora_rank",    type=int, default=LORA_RANK)
-    parser.add_argument("--seed",         type=int, default=42)
-    parser.add_argument("--no_eval",      action="store_true", help="Skip before/after eval")
-    parser.add_argument("--eval_only",    action="store_true")
-    parser.add_argument("--push_to_hub",  action="store_true")
-    parser.add_argument("--hub_model_id", default=None)
+    parser.add_argument("--model",          default=DEFAULT_MODEL)
+    parser.add_argument("--output_dir",     default=DEFAULT_OUTPUT)
+    parser.add_argument("--episodes",       type=int, default=200)
+    parser.add_argument("--lora_rank",      type=int, default=LORA_RANK)
+    parser.add_argument("--n_generations",  type=int, default=None,
+                        help="GRPO group size (default: N_GENERATIONS constant). "
+                             "Use 2 on T4 Colab, 4 for best gradient quality.")
+    parser.add_argument("--seed",           type=int, default=42)
+    parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
+    parser.add_argument("--eval_only",      action="store_true")
+    parser.add_argument("--push_to_hub",    action="store_true")
+    parser.add_argument("--hub_model_id",   default=None)
     args = parser.parse_args()
+
+    # Allow CLI override of group size (useful for Colab memory tuning)
+    if args.n_generations is not None:
+        global N_GENERATIONS, BATCH_SIZE
+        N_GENERATIONS = args.n_generations
+        # Adjust batch size to stay divisible
+        if BATCH_SIZE % N_GENERATIONS != 0:
+            BATCH_SIZE = N_GENERATIONS
 
     if args.eval_only:
         evaluate(args.model, n_episodes=20, seed=args.seed)
