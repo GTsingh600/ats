@@ -1,34 +1,43 @@
-"""FastAPI application entrypoint for the ATC optimization environment."""
+"""FastAPI application for the multi-agent ATC environment.
+
+Exposes:
+  OpenEnv standard surface (via create_app):
+    POST /reset
+    POST /step
+    GET  /state
+    GET  /health
+
+  Extended multi-agent REST endpoints:
+    POST /multi_agent/reset
+    POST /multi_agent/step/bid
+    POST /multi_agent/finalize
+    POST /multi_agent/episode
+    GET  /multi_agent/profiles
+    GET  /multi_agent/status
+
+Usage:
+  uvicorn server.app:app --host 0.0.0.0 --port 8000
+"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 try:
     from openenv.core.env_server.http_server import create_app
-except ImportError as exc:  # pragma: no cover
+except ImportError as exc:
     raise ImportError(
-        "openenv is required to run this environment. Install dependencies first."
+        "openenv is required. Install dependencies first."
     ) from exc
 
 try:
-    from ..models import ATCOptimizationAction, ATCOptimizationObservation
-    from . import ui_runner
-    from .atc_environment import ATCOptimizationEnvironment
-except ImportError:
-    from models import ATCOptimizationAction, ATCOptimizationObservation
-    from server import ui_runner
-    from server.atc_environment import ATCOptimizationEnvironment
-
-try:
+    from ..atc_env.models import ATCAction, ATCObservation
+    from ..atc_env.server.atc_environment import ATCEnvironment
     from ..multi_agent.environment import MultiAgentATCEnvironment
     from ..multi_agent.generator import ChallengeGenerator
     from ..multi_agent.supervisor import SupervisorAgent
@@ -37,6 +46,8 @@ try:
         AMANAction, DMANAction, MultiAgentEpisodeResult, SupervisorProfileName,
     )
 except ImportError:
+    from atc_env.models import ATCAction, ATCObservation
+    from atc_env.server.atc_environment import ATCEnvironment
     from multi_agent.environment import MultiAgentATCEnvironment
     from multi_agent.generator import ChallengeGenerator
     from multi_agent.supervisor import SupervisorAgent
@@ -45,80 +56,19 @@ except ImportError:
         AMANAction, DMANAction, MultiAgentEpisodeResult, SupervisorProfileName,
     )
 
-# Shared multi-agent singletons (one env per server process, serialised via lock)
-_ma_env       = MultiAgentATCEnvironment(seed=0)
-_ma_generator = ChallengeGenerator(seed=0)
+# Shared multi-agent singletons (serialised via lock — one env per server process)
+_ma_env        = MultiAgentATCEnvironment(seed=0)
+_ma_generator  = ChallengeGenerator(seed=0)
 _ma_supervisor = SupervisorAgent()
 _MA_LOCK = asyncio.Lock()
 
-
-UI_TEMPLATE_PATH = Path(__file__).with_name("ui_console.html")
-PLANE_IMAGE_PATH = Path(__file__).with_name("ui_aircraft.png")
-
-
 app = create_app(
-    ATCOptimizationEnvironment,
-    ATCOptimizationAction,
-    ATCOptimizationObservation,
+    ATCEnvironment,
+    ATCAction,
+    ATCObservation,
     env_name="atc_env",
     max_concurrent_envs=8,
 )
-
-
-def _render_task_strips() -> str:
-    return "\n".join(
-        (
-            f'<article class="strip" data-task-id="{task["task_id"]}" data-state="ready">'
-            f'<div class="strip-top"><span class="strip-title">{task["title"]}</span>'
-            f'<span class="strip-difficulty {task["difficulty"].lower()}">{task["difficulty"]}</span></div>'
-            f'<div class="strip-summary">{task["summary"]}</div>'
-            f'<div class="strip-meta"><span>Baseline {task["random_baseline"]:.2f}</span>'
-            '<span class="strip-score">Awaiting run</span></div>'
-            "</article>"
-        )
-        for task in ui_runner.UI_TASKS
-    )
-
-
-def _render_index_html() -> str:
-    template = UI_TEMPLATE_PATH.read_text(encoding="utf-8")
-    model_options = "\n".join(
-        f'<option value="{model}">{model}</option>'
-        for model in ui_runner.MODEL_OPTIONS
-    )
-    plane_image_bytes = PLANE_IMAGE_PATH.read_bytes()
-    plane_image_src = (
-        "data:image/png;base64," + base64.b64encode(plane_image_bytes).decode("ascii")
-    )
-    return (
-        template.replace("__MODEL_OPTIONS__", model_options)
-        .replace("__PLANE_IMAGE_SRC__", plane_image_src)
-        .replace("__TASK_DATA__", json.dumps(ui_runner.UI_TASKS))
-        .replace("__TASK_STRIPS__", _render_task_strips())
-    )
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def index() -> HTMLResponse:
-    return HTMLResponse(_render_index_html())
-
-
-@app.post("/ui/run-inference", include_in_schema=False)
-async def run_inference_ui(
-    payload: ui_runner.InferenceRunRequest,
-) -> Dict[str, Any]:
-    """Run user-triggered inference from the Space UI."""
-
-    async with ui_runner.INFERENCE_LOCK:
-        try:
-            return await asyncio.to_thread(ui_runner.run_requested_inference, payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # pragma: no cover - defensive guard
-            raise HTTPException(
-                status_code=500,
-                detail=f"Inference run failed: {exc}",
-            ) from exc
 
 
 # ── Multi-agent REST endpoints ─────────────────────────────────────────────────
@@ -245,10 +195,7 @@ async def ma_status() -> Dict[str, Any]:
 
 
 def main(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Run the FastAPI server directly."""
-
     import uvicorn
-
     uvicorn.run(app, host=host, port=port)
 
 

@@ -215,6 +215,7 @@ def aman_reward_fn(
         cf_outcome = simulate_plan(task, _naive_arrival_slots(task) + dman_slots)
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
+        json_fmt = _json_format_score(completion)
         reward = (
             0.26 * delay_eff
             + 0.20 * emg_score
@@ -223,8 +224,18 @@ def aman_reward_fn(
             + 0.10 * tom_bonus
             + 0.05 * sup_align
             + 0.05 * rationale_score
+            + 0.05 * json_fmt
             - cross_penalty
         )
+
+        # Layered safety gates — hard ceilings that cannot be bought off by efficiency
+        if outcome.metrics.conflict_count > 0:
+            reward = min(reward, 0.30)   # conflict-free gate
+        if emg_miss > 0:
+            reward = min(reward, 0.40)   # emergency hard gate
+        if coverage < 0.50:
+            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
             role="AMAN",
@@ -236,7 +247,11 @@ def aman_reward_fn(
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
+                "json_fmt": json_fmt,
                 "cross_penalty": -cross_penalty,
+                "conflict_gate": int(outcome.metrics.conflict_count > 0),
+                "emg_gate": int(emg_miss > 0),
+                "coverage_floor": int(coverage < 0.50),
                 "final_reward": reward,
             },
         )
@@ -345,6 +360,7 @@ def dman_reward_fn(
         cf_outcome = simulate_plan(task, aman_slots + _naive_departure_slots(task))
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
+        json_fmt = _json_format_score(completion)
         reward = (
             0.23 * delay_eff
             + 0.17 * atfm_score
@@ -353,9 +369,19 @@ def dman_reward_fn(
             + 0.12 * cf_advantage
             + 0.10 * tom_bonus
             + 0.05 * sup_align
-            + 0.05 * rationale_score
+            + 0.03 * rationale_score
+            + 0.02 * json_fmt
             - cross_penalty
         )
+
+        # Layered safety gates
+        if outcome.metrics.conflict_count > 0:
+            reward = min(reward, 0.30)   # conflict-free gate
+        if emg_miss > 0:
+            reward = min(reward, 0.40)   # emergency hard gate
+        if coverage < 0.50:
+            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
             role="DMAN",
@@ -368,7 +394,11 @@ def dman_reward_fn(
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
+                "json_fmt": json_fmt,
                 "cross_penalty": -cross_penalty,
+                "conflict_gate": int(outcome.metrics.conflict_count > 0),
+                "emg_gate": int(emg_miss > 0),
+                "coverage_floor": int(coverage < 0.50),
                 "final_reward": reward,
             },
         )
@@ -464,6 +494,25 @@ def supervisor_reward_fn(
         rewards.append(round(min(1.0, score + calibration_bonus), 4))
 
     return rewards
+
+
+def _json_format_score(completion: Any) -> float:
+    """Returns 1.0 if completion contains valid JSON with expected keys, else 0.0."""
+    text = _coerce_completion_text(completion)
+    try:
+        # Strip markdown code fences if present
+        stripped = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
+        data = json.loads(stripped)
+        if isinstance(data, dict) and (
+            "arrival_slots" in data or "departure_slots" in data or "rationale" in data
+        ):
+            return 1.0
+        return 0.5  # valid JSON but unexpected shape
+    except Exception:
+        # Partial credit if JSON block is present but malformed
+        if "{" in text and ("slots" in text or "rationale" in text):
+            return 0.2
+        return 0.0
 
 
 def _score_rationale_quality(

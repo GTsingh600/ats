@@ -345,7 +345,6 @@ def _llm_action(
 ) -> Optional[AMANAction | DMANAction]:
     if client is None:
         return None
-    from openai import OpenAI, APIError
     try:
         resp = client.chat.completions.create(
             model=model_name,

@@ -46,15 +46,38 @@ def _load_client(model_name_or_path: str) -> Optional[object]:
     # Local checkpoint: load with Unsloth and spin up inference
     if Path(model_name_or_path).exists():
         try:
+            import json as _json
             from unsloth import FastLanguageModel
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name_or_path,
-                max_seq_length=4096,
-                load_in_4bit=True,
-            )
+
+            ckpt = Path(model_name_or_path)
+            adapter_cfg_path = ckpt / "adapter_config.json"
+            full_cfg_path    = ckpt / "config.json"
+
+            if adapter_cfg_path.exists() and not full_cfg_path.exists():
+                # TRL saves LoRA adapters without the base model config —
+                # load base model first, then apply the adapter on top.
+                adapter_cfg = _json.loads(adapter_cfg_path.read_text())
+                base_name   = adapter_cfg.get(
+                    "base_model_name_or_path",
+                    os.getenv("BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct"),
+                )
+                print(f"  LoRA adapter detected — loading base: {base_name}")
+                model, tokenizer = FastLanguageModel.from_pretrained(
+                    base_name,
+                    max_seq_length=4096,
+                    load_in_4bit=True,
+                )
+                from peft import PeftModel
+                model = PeftModel.from_pretrained(model, str(ckpt))
+            else:
+                model, tokenizer = FastLanguageModel.from_pretrained(
+                    str(ckpt),
+                    max_seq_length=4096,
+                    load_in_4bit=True,
+                )
+
             FastLanguageModel.for_inference(model)
             print(f"  Loaded local checkpoint: {model_name_or_path}")
-            # Return a thin wrapper that behaves like OpenAI client
             return _LocalModelClient(model, tokenizer)
         except ImportError:
             print(f"  [WARN] unsloth not installed — using API for {model_name_or_path}")

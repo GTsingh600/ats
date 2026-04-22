@@ -57,6 +57,18 @@ FLOOR_THRESHOLD      = 0.30   # ease back when agents consistently below this
 EMA_ALPHA            = 0.2    # exponential moving average smoothing factor
 MAX_MUTATIONS_PER_EPISODE = 3 # cap mutations to keep scenarios solvable
 MIN_WINDOW_WIDTH     = 8      # never squeeze window below 8 minutes
+
+# LLM outputs non-canonical priority strings; map them to valid PriorityClass values
+_PRIORITY_ALIASES: Dict[str, str] = {
+    "high": "emergency",
+    "urgent": "emergency",
+    "critical": "emergency",
+    "med": "medical",
+    "low": "normal",
+    "standard": "normal",
+    "routine": "normal",
+    "conn": "connection",
+}
 MASTERY_WINDOW       = 10     # rolling window for per-scenario success rate
 MASTERY_THRESHOLD    = 0.55   # rate below this → mutation considered "weak"/underused
 
@@ -371,8 +383,12 @@ class ChallengeGenerator:
         p = mut.params
         fid = p.get("flight_id", "EMG001")
         minute = int(p.get("minute", 20))
-        priority_str = p.get("priority", "emergency")
-        priority = PriorityClass(priority_str)
+        priority_str = str(p.get("priority", "emergency")).lower().strip()
+        priority_str = _PRIORITY_ALIASES.get(priority_str, priority_str)
+        try:
+            priority = PriorityClass(priority_str)
+        except ValueError:
+            priority = PriorityClass.EMERGENCY
         runway_id = p.get("runway", task.runways[0].runway_id)
         runway = next((r for r in task.runways if r.runway_id == runway_id), task.runways[0])
 
@@ -396,9 +412,14 @@ class ChallengeGenerator:
         p = mut.params
         fid = p.get("flight_id", "WKT001")
         minute = int(p.get("minute", 10))
-        wake = WakeClass(p.get("wake_class", "H"))
-        op_str = p.get("operation", "arrival")
-        operation = OperationType(op_str)
+        try:
+            wake = WakeClass(str(p.get("wake_class", "H")).upper())
+        except ValueError:
+            wake = WakeClass.HEAVY
+        try:
+            operation = OperationType(str(p.get("operation", "arrival")).lower())
+        except ValueError:
+            operation = OperationType.ARRIVAL
         runway_id = p.get("runway", task.runways[0].runway_id)
 
         new_flight = FlightRecord(

@@ -1,11 +1,13 @@
 spec_version: 1
 name: atc_env
-version: 2.0.0
+version: 3.0.0
 description: >
-  Realistic air traffic control disruption recovery benchmark with multi-agent
-  AMAN/DMAN coordination. Single-agent and multi-agent modes supported.
-  Features self-play adversarial generator, Snorkel-style supervisor with
-  rotating preference profiles, and GRPO-trainable cooperative controllers.
+  Multi-agent RLVE benchmark for air traffic control disruption recovery.
+  AMAN and DMAN controllers coordinate via a 3-round BID/NEGOTIATE/FINAL
+  protocol over shared runways. An adversarial ChallengeGenerator applies
+  EMA-based curriculum mutation. A SupervisorAgent with 5 rotating preference
+  profiles (safety / throughput / fuel / emergency / fairness) provides
+  grounded dense reward. Trained with GRPO + Unsloth 4-bit QLoRA on Colab T4.
 type: space
 runtime: fastapi
 app: server.app:app
@@ -13,18 +15,21 @@ port: 8000
 tags:
 - openenv
 - air-traffic-control
-- optimization
 - multi-agent
-- self-play
+- rlve
 - grpo
+- cooperative-competitive
+- self-play
 - aman
 - dman
+- curriculum-learning
 
-# ── Single-agent mode ──────────────────────────────────────────────────────────
-action_space: models:ATCOptimizationAction
-observation_space: models:ATCOptimizationObservation
+# ── Primary interface (OpenEnv-compliant) ─────────────────────────────────────
+action_space: atc_env.models:ATCAction
+observation_space: atc_env.models:ATCObservation
+state_space: atc_env.models:ATCState
 
-# ── Multi-agent mode ───────────────────────────────────────────────────────────
+# ── Multi-agent configuration ─────────────────────────────────────────────────
 multi_agent:
   enabled: true
   mode: cooperative_competitive
@@ -38,11 +43,13 @@ multi_agent:
       action_space: multi_agent.models:DMANAction
       observation_space: multi_agent.models:MultiAgentObservation
     - role: GENERATOR
-      description: Adversarial self-play agent — mutates tasks to challenge controllers
+      description: Adversarial self-play agent — mutates tasks via EMA curriculum to challenge controllers
       action_space: multi_agent.models:GeneratorAction
       observation_space: multi_agent.models:MultiAgentObservation
     - role: SUPERVISOR
-      description: Simulated expert with rotating preference profiles (Snorkel-style)
+      description: >
+        Expert with rotating preference profiles (safety_strict / throughput_max /
+        fuel_economy / emergency_priority / fairness_balanced)
       action_space: null
       observation_space: multi_agent.models:MultiAgentObservation
   negotiation_rounds: 3
@@ -50,11 +57,33 @@ multi_agent:
   shared_runways: true
   emergency_broadcast: true
 
+# ── Reward design ─────────────────────────────────────────────────────────────
+reward:
+  type: potential_based_shaping  # Ng et al. 1999 — preserves optimal policy
+  roles:
+    AMAN:
+      components: [delay_efficiency, emergency_score, coverage, counterfactual_advantage,
+                   theory_of_mind_bonus, supervisor_alignment, rationale_quality, json_format]
+      hard_gates:
+        conflict_free: {cap: 0.30, condition: "conflict_count > 0"}
+        emergency:     {cap: 0.40, condition: "emg_miss > 0"}
+        coverage_floor: {penalty: -0.30, condition: "coverage < 0.50"}
+    DMAN:
+      components: [delay_efficiency, atfm_compliance, emergency_score, coverage,
+                   counterfactual_advantage, theory_of_mind_bonus, supervisor_alignment,
+                   rationale_quality, json_format]
+      hard_gates:
+        conflict_free: {cap: 0.30, condition: "conflict_count > 0"}
+        emergency:     {cap: 0.40, condition: "emg_miss > 0"}
+        coverage_floor: {penalty: -0.30, condition: "coverage < 0.50"}
+    GENERATOR:
+      components: [challenge_score, solvability_bonus]
+    SUPERVISOR:
+      components: [preference_alignment, calibration_bonus]
+
 # ── Graders ───────────────────────────────────────────────────────────────────
 graders:
-  single_agent:
-    module: graders:GatedCompositeGrader
-  multi_agent:
+  primary:
     - module: graders:MultiAgentCoordinationGrader
       weight: 0.40
     - module: graders:GatedCompositeGrader
@@ -113,11 +142,12 @@ tasks:
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   algorithm: GRPO
+  n_generations: 4
+  kl_coeff: 0.01
   framework: unsloth + trl
   base_model: Qwen/Qwen2.5-7B-Instruct
   colab_compatible: true
   vram_requirement: 16GB
   lora_rank: 16
   script: training/train_grpo.py
-  eval_script: training/eval.py
   reward_functions: training/reward_functions.py
