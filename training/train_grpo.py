@@ -78,8 +78,6 @@ from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import AgentRole, SupervisorProfileName
 from multi_agent.supervisor import SupervisorAgent
 from tasks import task_catalog, ordered_tasks
-from engine import simulate_plan
-from graders import grade_task
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
@@ -426,54 +424,55 @@ def train(
 
 # ── Quick heuristic eval (no LLM needed — uses planner baseline) ──────────────
 
-def _quick_heuristic_eval(n_episodes: int = 10) -> Dict[str, Any]:
-    """Run heuristic-only episodes to get before/after comparison metrics."""
-    import random
-    from planner import build_heuristic_plan
+def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
+    """Run heuristic-only multi-agent episodes (client=None → deterministic planner).
 
-    catalog = task_catalog()
-    task_list = list(ordered_tasks())
+    Uses run_episode so metrics are AMAN/DMAN rewards from the real multi-agent
+    environment — not single-agent grades. Same format as _run_model_episodes so
+    _print_improvement can compare them directly.
+    """
+    from multi_agent.inference import run_episode as _run_ep
+
     env = MultiAgentATCEnvironment(seed=99)
-    generator = ChallengeGenerator(seed=99)
-    rng = random.Random(99)
+    sup = SupervisorAgent()
 
-    composite_scores: List[float] = []
-    conflict_counts:  List[int]   = []
-    emg_handled:      List[int]   = []
-    coord_scores:     List[float] = []
+    # Fixed task list — no generator mutations for a stable repeatable baseline
+    eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
+
+    composites, aman_rews, dman_rews, conflict_list, emg_list = [], [], [], [], []
 
     for ep in range(n_episodes):
-        base_task = rng.choice(task_list)
-        mutated, _ = generator.mutate(base_task)
-        env.reset(mutated_task=mutated, episode_id=ep)
-
-        # Use heuristic planner as baseline agent
-        outcome = build_heuristic_plan(mutated)
-        grades = grade_task(mutated, outcome, outcome.plan, rationale="heuristic")
-        composite = next(
-            (g.score for g in grades if g.grader_name == "composite_task_grader"),
-            0.0,
-        )
-        composite_scores.append(composite)
-        conflict_counts.append(outcome.metrics.conflict_count)
-        emg_handled.append(
-            sum(
-                1 for f in mutated.flights
-                if f.priority.value in ("emergency", "medical")
-                and any(s.flight_id == f.flight_id for s in outcome.plan)
+        task_id = eval_tasks[ep % len(eval_tasks)]
+        try:
+            r = _run_ep(
+                task_id      = task_id,
+                client       = None,   # heuristic mode — no LLM
+                env          = env,
+                generator    = None,
+                supervisor   = sup,
+                episode_id   = ep,
+                use_generator= False,
             )
-        )
-        generator.update(composite)
+            composites.append(float(r.get("composite", 0)))
+            aman_rews.append(float(r.get("aman_reward", 0)))
+            dman_rews.append(float(r.get("dman_reward", 0)))
+            conflict_list.append(int(r.get("conflicts", 0)))
+            emg_list.append(int(r.get("emg_arr_ok", 0)) + int(r.get("emg_dep_ok", 0)))
+        except Exception as exc:
+            print(f"  [WARN] Heuristic eval ep {ep} failed: {exc}")
 
-    def _mean(lst):
-        return round(sum(lst) / max(1, len(lst)), 3)
+    def _mean(lst: list) -> float:
+        return round(sum(lst) / max(1, len(lst)), 3) if lst else 0.0
 
     return {
+        "tag":              "HEURISTIC BASELINE",
         "n_episodes":       n_episodes,
-        "mean_composite":   _mean(composite_scores),
-        "mean_conflicts":   _mean(conflict_counts),
-        "mean_emg_handled": _mean(emg_handled),
-        "scores":           [round(s, 3) for s in composite_scores],
+        "mean_composite":   _mean(composites),
+        "mean_aman_reward": _mean(aman_rews),
+        "mean_dman_reward": _mean(dman_rews),
+        "mean_conflicts":   _mean(conflict_list),
+        "mean_emg_handled": _mean(emg_list),
+        "scores":           [round(s, 3) for s in composites],
     }
 
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ATC Multi-Agent GRPO Training — Colab Notebook
-Run each cell top-to-bottom on a T4 GPU runtime.
 Runtime → Change runtime type → T4 GPU
+Run cells top-to-bottom.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -24,30 +24,28 @@ subprocess.run(
     check=True,
 )
 os.chdir(REPO_DIR)
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
 print(f"Repo ready: {REPO_DIR}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 2 — Install Dependencies (single clean call)
+# Cell 2 — Install Dependencies
 # ══════════════════════════════════════════════════════════════════════════════
 
 subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "trl"], check=False)
-
 subprocess.run(
     [
         sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
-        # Core training stack
         "unsloth[colab-new]",
         "trl==0.15.2",
         "transformers==4.51.3",
         "accelerate>=0.32.0",
         "peft>=0.12.0",
         "bitsandbytes>=0.43.0",
-        # Data / utilities
         "datasets>=2.20.0",
         "numpy>=1.26.0",
         "matplotlib>=3.9.0",
-        # Environment / API
         "openenv-core[core]>=0.2.3",
         "openai>=1.30.0",
         "fastapi>=0.111.0",
@@ -57,18 +55,20 @@ subprocess.run(
     check=True,
 )
 
-# Disable wandb noise
 os.environ["WANDB_MODE"]             = "disabled"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 print("Install complete.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Cell 3 — Smoke-test Imports
+# (unsloth MUST be imported before torch/trl/transformers)
 # ══════════════════════════════════════════════════════════════════════════════
 
-import torch, trl, transformers
+import unsloth                          # ← first, enables Unsloth kernel patches
+import torch
+import trl
+import transformers
 from trl import GRPOConfig, GRPOTrainer
 from unsloth import FastLanguageModel
 
@@ -78,41 +78,45 @@ print(f"TRL         : {trl.__version__}")
 print(f"Transformers: {transformers.__version__}")
 print(f"CUDA        : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
     print(f"GPU         : {torch.cuda.get_device_name(0)}")
-    print(f"VRAM        : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"VRAM        : {props.total_memory / 1e9:.1f} GB")
 
 # Repo imports
-sys.path.insert(0, REPO_DIR)
 from training.dataset import build_episode_dataset
 data = build_episode_dataset(n_episodes=2, seed=42)
-print(f"\nDataset smoke-test: {len(data)} samples, roles: {sorted({x['agent_role'] for x in data})}")
+print(f"\nDataset smoke: {len(data)} samples | roles: {sorted({x['agent_role'] for x in data})}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 4 — Train
+# Cell 4 — Train  (in-process — full tracebacks visible)
 #
-# --n_generations 2   → safe for T4 (14.5 GB); use 4 if you have A100
-# --episodes 50       → ~2 hr on T4; use 200 for full training
-# --no_eval           → add this flag to skip before/after model inference
-#                        (saves ~15 min per eval run on T4)
+# T4 safe settings:  N_GENERATIONS=2, BATCH_SIZE=2, GRAD_ACCUM=4
+#   → effective batch = 8, group size = 2
+# A100 / better VRAM: set N_GENERATIONS=4 for more stable advantage estimates
+#
+# run_eval=True  → runs base-model eval BEFORE training and trained-model eval
+#                  AFTER training, prints before/after comparison table.
+#                  Each eval pass ≈ 15 min on T4 (3 model inference episodes).
+#                  Set run_eval=False to skip and save ~30 min total.
 # ══════════════════════════════════════════════════════════════════════════════
 
-os.chdir(REPO_DIR)
+import training.train_grpo as _grpo
+
+# Override memory-critical constants for T4 before training starts
+_grpo.N_GENERATIONS = 2   # 2 = T4 safe; 4 = better gradient quality (A100)
+_grpo.BATCH_SIZE    = 2   # must stay divisible by N_GENERATIONS
+_grpo.GRAD_ACCUM    = 4   # effective batch = BATCH_SIZE * GRAD_ACCUM = 8
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-subprocess.run(
-    [
-        sys.executable, "training/train_grpo.py",
-        "--model",          "Qwen/Qwen2.5-7B-Instruct",
-        "--episodes",       "50",
-        "--lora_rank",      "16",
-        "--n_generations",  "2",      # 2 = T4 safe; 4 = better gradients (A100)
-        "--seed",           "42",
-        "--output_dir",     OUTPUT_DIR,
-        # "--no_eval",       # uncomment to skip the ~15-min before/after model eval
-    ],
-    check=True,
-    cwd=REPO_DIR,
+_grpo.train(
+    model_name  = "Qwen/Qwen2.5-7B-Instruct",
+    output_dir  = OUTPUT_DIR,
+    n_episodes  = 50,       # ~2 hr on T4; use 200 for full training
+    lora_rank   = 16,
+    seed        = 42,
+    run_eval    = True,     # set False to skip before/after model inference
 )
 
 
@@ -120,23 +124,22 @@ subprocess.run(
 # Cell 5 — Plot Reward Curves
 # ══════════════════════════════════════════════════════════════════════════════
 
+from pathlib import Path
+from IPython.display import display, Image
+
 PLOTS_DIR = f"{OUTPUT_DIR}/plots"
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 subprocess.run(
     [
         sys.executable, "training/plot_rewards.py",
-        "--input", f"{OUTPUT_DIR}/reward_curves.json",
-        "--save",  PLOTS_DIR,
+        "--input",   f"{OUTPUT_DIR}/reward_curves.json",
+        "--save",    PLOTS_DIR,
         "--no_show",
     ],
-    check=False,          # non-fatal if plot file not found
+    check=False,
     cwd=REPO_DIR,
 )
-
-# Display inline if plots were produced
-from pathlib import Path
-from IPython.display import display, Image
 
 for png in sorted(Path(PLOTS_DIR).glob("*.png")):
     print(png.name)
@@ -144,12 +147,12 @@ for png in sorted(Path(PLOTS_DIR).glob("*.png")):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 6 — Standalone Eval (optional, run after training)
+# Cell 6 — Standalone Eval  (optional — already runs inside Cell 4)
 #
-# Compares heuristic baseline vs trained checkpoint across N episodes.
-# Already runs automatically inside training (Cell 4) via run_eval=True.
-# Use this cell only if you want more episodes or a separate eval run.
+# Use this only if you want more episodes or re-run eval separately.
 # ══════════════════════════════════════════════════════════════════════════════
+
+import json
 
 EVAL_OUT = f"{OUTPUT_DIR}/eval_results.json"
 
@@ -165,8 +168,6 @@ subprocess.run(
     cwd=REPO_DIR,
 )
 
-# Pretty-print results
-import json
 if Path(EVAL_OUT).exists():
     results = json.loads(Path(EVAL_OUT).read_text())
     print("\n=== EVAL RESULTS ===")
@@ -178,18 +179,28 @@ if Path(EVAL_OUT).exists():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 7 — Quick Sanity: Run Heuristic Baseline
-#
-# No model needed. Verifies the multi-agent environment works end-to-end.
+# Cell 7 — Heuristic Sanity Check  (no model needed)
+# Verifies multi-agent environment works end-to-end.
 # ══════════════════════════════════════════════════════════════════════════════
 
-subprocess.run(
-    [
-        sys.executable, "multi_agent/inference.py",
-        "--all_tasks",
-        "--episodes", "1",
-        "--no_generator",
-    ],
-    check=False,
-    cwd=REPO_DIR,
+from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.generator import ChallengeGenerator
+from multi_agent.supervisor import SupervisorAgent
+from multi_agent.inference import run_episode
+
+env = MultiAgentATCEnvironment(seed=0)
+gen = ChallengeGenerator(seed=0)
+sup = SupervisorAgent()
+
+result = run_episode(
+    task_id      = "bengaluru_irrops_hard",
+    client       = None,          # heuristic mode — no LLM
+    env          = env,
+    generator    = gen,
+    supervisor   = sup,
+    episode_id   = 0,
+    use_generator= False,
 )
+print(f"\nHeuristic sanity: composite={result['composite']:.3f} "
+      f"aman={result['aman_reward']:.3f} dman={result['dman_reward']:.3f} "
+      f"conflicts={result['conflicts']}")
