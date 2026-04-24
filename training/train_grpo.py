@@ -332,8 +332,11 @@ def train(
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "composite": []
     }
 
+    _inspect_path = Path(output_dir) / "generation_samples.jsonl"
+
     class RewardLogger:
         __name__ = "combined_reward_fn"
+        _call_count = 0
 
         def __call__(self, *args, **kwargs):
             # TRL <0.17: reward_func(completions=..., **kwargs)
@@ -361,6 +364,12 @@ def train(
                     reward_log[role].append(r)
                 reward_log["composite"].append(r)
 
+            # Sample actual completions every 50 calls — rising reward alone won't
+            # catch reward hacking; inspect generation_samples.jsonl during training.
+            RewardLogger._call_count += 1
+            if RewardLogger._call_count % 50 == 0:
+                _log_generation_samples(completions, rewards, roles, _inspect_path)
+
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
             if len(reward_log["composite"]) % 50 == 0 and len(reward_log["composite"]) > 50:
@@ -387,6 +396,11 @@ def train(
     trainer.train()
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    # Save adapter weights BEFORE calling FastLanguageModel.for_inference() below.
+    # for_inference() fuses LoRA into base weights in-place — saving after that
+    # would write a merged model, not the adapter. Do NOT merge_and_unload() a
+    # 4-bit model and save naively; use save_pretrained_merged() if you need
+    # a merged 16-bit checkpoint for deployment.
     print(f"\nSaving model to {output_dir}...")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -626,6 +640,31 @@ def _save_json(data: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _log_generation_samples(
+    completions: List[str],
+    rewards: List[float],
+    roles: List[str],
+    path: Path,
+    n: int = 2,
+) -> None:
+    """Append sample completions to JSONL for manual inspection during training.
+
+    Catches reward hacking that rising aggregate reward won't reveal —
+    inspect this file when _check_reward_hacking fires a warning.
+    """
+    import datetime
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for i in range(min(n, len(completions))):
+            json.dump({
+                "ts":         datetime.datetime.utcnow().isoformat(),
+                "role":       roles[i] if i < len(roles) else "unknown",
+                "reward":     round(float(rewards[i]), 4),
+                "completion": completions[i][:600],
+            }, f)
+            f.write("\n")
 
 
 def _check_reward_hacking(reward_log: Dict[str, List[float]]) -> None:

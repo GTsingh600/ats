@@ -354,6 +354,7 @@ def _llm_action(
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
+            timeout=30,
         )
         text = (resp.choices[0].message.content or "").strip()
         if role == AgentRole.AMAN:
@@ -379,6 +380,19 @@ def _save_transcript(
             json.dump(data, fh, indent=2, default=str)
     except OSError as exc:
         _p(f"[WARN] Could not save transcript for episode {episode_id}: {exc}")
+
+
+def _recent_mutation_types(generator: ChallengeGenerator, limit: int = 3) -> List[str]:
+    """Return recent mutation type names regardless of stored history shape."""
+    mutation_types: List[str] = []
+    for entry in getattr(generator, "_mutation_history", [])[-limit:]:
+        if isinstance(entry, dict):
+            mutation_type = entry.get("type")
+        else:
+            mutation_type = getattr(getattr(entry, "mutation_type", None), "value", None)
+        if mutation_type:
+            mutation_types.append(str(mutation_type))
+    return mutation_types
 
 
 def run_episode(
@@ -407,10 +421,7 @@ def run_episode(
     if use_generator and generator is not None:
         mutated_task, solvable = generator.mutate(base_task)
         gen_difficulty = generator.difficulty_level
-        mutations_applied = [
-            m.mutation_type.value
-            for m in getattr(generator, "_mutation_history", [])[-3:]
-        ]
+        mutations_applied = _recent_mutation_types(generator)
     else:
         mutated_task, solvable = base_task, True
         gen_difficulty = 1
@@ -538,6 +549,60 @@ def run_episode(
     return episode_result
 
 
+# ── Demo breakdown printer ────────────────────────────────────────────────────
+
+def _print_demo_breakdown(task_id: str, episode: int, result: Dict[str, Any]) -> None:
+    """Print verifier component breakdown for demo presentations.
+
+    Format mirrors hackathon guide: verifier output visible between baseline
+    and trained model attempts.
+    """
+    W = 58
+    _p(f"\n{'─'*W}")
+    _p(f"  VERIFIER BREAKDOWN  |  task={task_id}  ep={episode}")
+    _p(f"{'─'*W}")
+    _p(f"  {'Metric':<26}  {'Value':>8}  {'Status'}")
+    _p(f"  {'─'*24}  {'─'*8}  {'─'*10}")
+
+    composite  = result["composite"]
+    aman_r     = result["aman_reward"]
+    dman_r     = result["dman_reward"]
+    coord      = result["coord_score"]
+    conflicts  = result["conflicts"]
+    atfm_viol  = result["atfm_viol"]
+    emg_arr    = result["emg_arr_ok"]
+    emg_dep    = result["emg_dep_ok"]
+    neg_rounds = result["neg_rounds"]
+    gen_lvl    = result["gen_difficulty"]
+    supervisor = result["supervisor"]
+
+    def _status(val, good, warn=None):
+        if warn is None:
+            return "✓ PASS" if val >= good else "✗ FAIL"
+        return "✓ PASS" if val >= good else ("△ WARN" if val >= warn else "✗ FAIL")
+
+    rows = [
+        ("Composite score",        f"{composite:.3f}",  _status(composite, 0.65, 0.50)),
+        ("AMAN reward",            f"{aman_r:.3f}",     _status(aman_r, 0.60, 0.40)),
+        ("DMAN reward",            f"{dman_r:.3f}",     _status(dman_r, 0.60, 0.40)),
+        ("Coordination score",     f"{coord:.3f}",      _status(coord, 0.55, 0.35)),
+        ("Cross-runway conflicts", f"{conflicts}",      "✓ PASS" if conflicts == 0 else "✗ FAIL"),
+        ("ATFM violations",        f"{atfm_viol}",      "✓ PASS" if atfm_viol == 0 else "△ WARN"),
+        ("Emergency arr on-time",  f"{emg_arr}",        "✓ PASS" if emg_arr else "✗ FAIL"),
+        ("Emergency dep on-time",  f"{emg_dep}",        "✓ PASS" if emg_dep else "✗ FAIL"),
+        ("Negotiation rounds",     f"{neg_rounds}",     "✓ 1-round" if neg_rounds <= 1 else "△ 2-round"),
+        ("Generator difficulty",   f"{gen_lvl}/6",      ""),
+        ("Supervisor profile",     supervisor,          ""),
+    ]
+    for label, val, status in rows:
+        _p(f"  {label:<26}  {val:>8}  {status}")
+
+    _p(f"{'─'*W}")
+    overall = "SUCCESS ✓" if composite >= SUCCESS_THRESHOLD else "FAIL ✗"
+    _p(f"  Overall: {overall}  (threshold={SUCCESS_THRESHOLD})")
+    _p(f"{'─'*W}\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -556,6 +621,9 @@ def main() -> None:
     parser.add_argument("--transcript_dir", default=None,
                         help="Directory to write per-episode JSON transcripts "
                              "(default: no transcripts saved)")
+    parser.add_argument("--demo", action="store_true",
+                        help="Print detailed grader breakdown after each episode "
+                             "(baseline → verifier → score for demo presentations)")
     args = parser.parse_args()
 
     model = args.model or MODEL_NAME
@@ -608,6 +676,8 @@ def main() -> None:
                 coord=result["coord_score"],
                 gen_diff=result["gen_difficulty"],
             )
+            if args.demo:
+                _print_demo_breakdown(task_id, ep, result)
             all_results.append({"task_id": task_id, "episode": ep, **result})
 
     # Summary
