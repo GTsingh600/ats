@@ -41,7 +41,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -622,13 +622,6 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     return rewards
 
 
-def _hf_live_grounded_generator(manager: Any, sd: int) -> Iterator[Dict[str, Any]]:
-    """Top-level generator for ``datasets.IterableDataset.from_generator`` (TRL/Accelerate batching)."""
-    from training.live_curriculum import iter_live_grounded_rows
-
-    yield from iter_live_grounded_rows(manager, int(sd))
-
-
 # ── Training entry point ──────────────────────────────────────────────────────
 
 def train(
@@ -789,29 +782,41 @@ def train(
             output_dir=Path(output_dir),
             continuous_state_path=continuous_path,
         )
-        # PyTorch IterableDataset + default_collate yields nested dict batches that include
-        # raw str fields; Accelerate's find_batch_size then crashes. HF IterableDataset matches
-        # Dataset.from_list and integrates with TRL GRPO.
-        _hf_cache = Path(output_dir) / ".hf_datasets_cache"
-        _hf_cache.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_DATASETS_CACHE", str(_hf_cache.resolve()))
+        # HF IterableDataset + TRL/Unsloth still collate nested ``prompt`` message dicts in a way
+        # that leaves string leaves in the batch dict; Accelerate's find_batch_size then crashes
+        # (TypeError: ... got str). Materialize a finite prefix and use ``Dataset.from_list`` —
+        # identical to the static grounded path, which is known-good with GRPOTrainer.
+        from training.live_curriculum import iter_live_grounded_rows
+
+        _max_rows = min(
+            600_000,
+            int(computed_max_steps) * int(max(1, batch_size)) * int(max(1, grad_accum))
+            * int(max(4, num_generations))
+            + 512,
+        )
+        _buf: List[Dict[str, Any]] = []
+        _row_it = iter_live_grounded_rows(curriculum_manager, int(seed))
+        for _ in range(_max_rows):
+            _buf.append(next(_row_it))
         try:
-            from datasets import IterableDataset as HFIterableDataset
+            from datasets import Dataset as HFDataset
         except ImportError:
             print("[ERROR] pip install datasets (required for live grounded GRPO)")
             sys.exit(1)
-        dataset = HFIterableDataset.from_generator(
-            _hf_live_grounded_generator,
-            gen_kwargs={"manager": curriculum_manager, "sd": int(seed)},
-        )
+        dataset = HFDataset.from_list(_buf)
         dataset_train: List[Dict[str, Any]] = []
         dataset_val: List[Dict[str, Any]] = []
         print(
-            f"    Live grounded iterable (max_steps={computed_max_steps}, "
+            f"    Live grounded (materialized n={len(_buf)}, max_steps={computed_max_steps}, "
             f"virtual_episodes≈{n_episodes}) — init {time.time()-t0:.1f}s"
         )
         _save_json(
-            {"mode": "live_iterable", "max_steps": computed_max_steps, "virtual_episodes": n_episodes},
+            {
+                "mode": "live_materialized",
+                "materialized_rows": len(_buf),
+                "max_steps": computed_max_steps,
+                "virtual_episodes": n_episodes,
+            },
             Path(output_dir) / "grounded_dataset_summary.json",
         )
     else:
