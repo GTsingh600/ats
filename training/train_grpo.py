@@ -34,6 +34,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 import time
 import warnings
@@ -76,6 +77,7 @@ from training.dataset import (
     build_episode_dataset,
     parse_aman_action,
     parse_dman_action,
+    parse_generator_action,
 )
 from training.reward_functions import (
     aman_reward_fn,
@@ -98,8 +100,16 @@ LORA_RANK      = 16
 LORA_ALPHA     = 32
 LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
 MAX_SEQ_LEN    = 4096
-MAX_NEW_TOKENS = 256
-TEMPERATURE    = 0.9   # higher temp → more diverse GRPO rollouts → non-zero group std
+MAX_NEW_TOKENS = 384
+TEMPERATURE    = 0.7
+# Role-aware generation budgets. GRPO supports one global max token cap, so we
+# use the max here and enforce per-role compactness in rewards/logging.
+ROLE_MAX_NEW_TOKENS = {
+    AgentRole.AMAN.value: 384,
+    AgentRole.DMAN.value: 384,
+    AgentRole.GENERATOR.value: 224,
+    AgentRole.SUPERVISOR.value: 160,
+}
 # 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
 # With N=2 the group std is near-zero, making the normalised advantage meaningless.
 N_GENERATIONS  = 4
@@ -161,11 +171,11 @@ def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
     if vram_gb >= 70:
         tuned["batch_size"] = max(tuned["batch_size"], 8)
         tuned["grad_accum"] = 1
-        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 256)
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 384)
     elif vram_gb >= 40:
         tuned["batch_size"] = max(tuned["batch_size"], 6)
         tuned["grad_accum"] = min(tuned["grad_accum"], 2)
-        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 320)
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 384)
     return tuned
 
 
@@ -521,7 +531,7 @@ def train(
     tuned = _auto_tune_for_gpu(torch)
     batch_size = tuned["batch_size"]
     grad_accum = tuned["grad_accum"]
-    max_new_tokens = tuned["max_new_tokens"]
+    max_new_tokens = max(tuned["max_new_tokens"], max(ROLE_MAX_NEW_TOKENS.values()))
 
     num_generations = _resolve_num_generations(batch_size, N_GENERATIONS)
     if num_generations != N_GENERATIONS:
@@ -540,7 +550,14 @@ def train(
     print(f"  Device:       {device_str}")
     print(
         f"  Tune:         batch={batch_size}, accum={grad_accum}, "
-        f"max_new_tokens={max_new_tokens}, logging_steps={LOGGING_STEPS}"
+        f"max_new_tokens={max_new_tokens}, temp={TEMPERATURE}, logging_steps={LOGGING_STEPS}"
+    )
+    print(
+        "  Role tokens:  "
+        f"AMAN={ROLE_MAX_NEW_TOKENS[AgentRole.AMAN.value]}, "
+        f"DMAN={ROLE_MAX_NEW_TOKENS[AgentRole.DMAN.value]}, "
+        f"GEN={ROLE_MAX_NEW_TOKENS[AgentRole.GENERATOR.value]}, "
+        f"SUP={ROLE_MAX_NEW_TOKENS[AgentRole.SUPERVISOR.value]}"
     )
     print(f"{'='*60}\n")
 
@@ -666,6 +683,9 @@ def train(
     reward_log: Dict[str, List[float]] = {
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "composite": []
     }
+    parse_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
 
     class RewardLogger:
         __name__ = "combined_reward_fn"
@@ -704,9 +724,25 @@ def train(
                     roles[-1] if roles else AgentRole.AMAN.value
                 ] * (len(rewards) - len(roles))
 
-            for r, role in zip(rewards, roles):
+            def _is_parse_ok(role: str, completion: Any) -> int:
+                if role == AgentRole.AMAN.value:
+                    return 1 if parse_aman_action(completion) is not None else 0
+                if role == AgentRole.DMAN.value:
+                    return 1 if parse_dman_action(completion) is not None else 0
+                if role == AgentRole.GENERATOR.value:
+                    return 1 if parse_generator_action(completion) is not None else 0
+                if role == AgentRole.SUPERVISOR.value:
+                    text = str(completion)
+                    if re.search(r'"score"\s*:\s*-?\d+(?:\.\d+)?', text):
+                        return 1
+                    return 0
+                return 0
+
+            for completion, r, role in zip(completions, rewards, roles):
                 if role in reward_log:
                     reward_log[role].append(r)
+                if role in parse_log:
+                    parse_log[role].append(_is_parse_ok(role, completion))
                 reward_log["composite"].append(r)
 
             # Reward-hacking detection: warn when composite rises but per-role variance
@@ -754,19 +790,29 @@ def train(
 
             def _fmt(v: float) -> str:
                 return "n/a" if v != v else f"{v:.3f}"
+            
+            def _parse_rate(role: str, window: int = 64) -> float:
+                vals = parse_log.get(role, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
 
             comp = _avg_last("composite")
             aman = _avg_last("AMAN")
             dman = _avg_last("DMAN")
             gen = _avg_last("GENERATOR")
             sup = _avg_last("SUPERVISOR")
+            p_aman = _parse_rate("AMAN")
+            p_dman = _parse_rate("DMAN")
             print(
                 "[LIVE] "
                 f"step={step}/{max_steps} "
                 f"loss={loss if loss is not None else 'n/a'} "
                 f"lr={lr if lr is not None else 'n/a'} "
                 f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
-                f"GEN={_fmt(gen)} SUP={_fmt(sup)}"
+                f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
+                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)}]"
             )
 
     if hasattr(trainer, "add_callback"):
@@ -1233,6 +1279,7 @@ def main() -> None:
     parser.add_argument("--batch_size",     type=int, default=None)
     parser.add_argument("--grad_accum",     type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--temperature",    type=float, default=None)
     parser.add_argument("--logging_steps",  type=int, default=None)
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
@@ -1249,13 +1296,15 @@ def main() -> None:
         if BATCH_SIZE % N_GENERATIONS != 0:
             BATCH_SIZE = N_GENERATIONS
 
-    global GRAD_ACCUM, MAX_NEW_TOKENS, LOGGING_STEPS
+    global GRAD_ACCUM, MAX_NEW_TOKENS, LOGGING_STEPS, TEMPERATURE
     if args.batch_size is not None:
         BATCH_SIZE = max(1, args.batch_size)
     if args.grad_accum is not None:
         GRAD_ACCUM = max(1, args.grad_accum)
     if args.max_new_tokens is not None:
         MAX_NEW_TOKENS = max(32, args.max_new_tokens)
+    if args.temperature is not None:
+        TEMPERATURE = max(0.1, min(1.5, args.temperature))
     if args.logging_steps is not None:
         LOGGING_STEPS = max(1, args.logging_steps)
 

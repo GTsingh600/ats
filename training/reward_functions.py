@@ -53,6 +53,12 @@ _SUPERVISOR = SupervisorAgent()
 _GENERATOR = ChallengeGenerator()
 _TRACE_REWARDS = os.getenv("ATC_REWARD_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 _DEFAULT_SUPERVISOR_PROFILE = SupervisorProfileName.SAFETY_STRICT
+_ROLE_TOKEN_BUDGETS = {
+    "AMAN": int(os.getenv("ATC_ROLE_TOKENS_AMAN", "384")),
+    "DMAN": int(os.getenv("ATC_ROLE_TOKENS_DMAN", "384")),
+    "GENERATOR": int(os.getenv("ATC_ROLE_TOKENS_GENERATOR", "224")),
+    "SUPERVISOR": int(os.getenv("ATC_ROLE_TOKENS_SUPERVISOR", "160")),
+}
 
 
 def _debug_reward_trace(role: str, components: Dict[str, float]) -> None:
@@ -94,6 +100,48 @@ def _safe_float(value: Any, default: float = 0.5) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _weighted_active_mean(parts: List[tuple[float, float, bool]]) -> float:
+    num = 0.0
+    den = 0.0
+    for value, weight, active in parts:
+        if not active:
+            continue
+        num += float(value) * float(weight)
+        den += float(weight)
+    return num / den if den > 1e-9 else 0.0
+
+
+def _approx_token_count(text: str) -> int:
+    # Simple, fast approximation suitable for relative penalties.
+    return max(0, len(text.split()))
+
+
+def _length_budget_penalty(role: str, completion: Any) -> float:
+    text = _coerce_completion_text(completion)
+    budget = max(32, _ROLE_TOKEN_BUDGETS.get(role, 256))
+    n = _approx_token_count(text)
+    if n <= budget:
+        return 0.0
+    overflow = n - budget
+    return min(0.25, overflow / max(1.0, float(budget)) * 0.25)
+
+
+def _controller_failure_reward(completion: Any, role: str) -> float:
+    """Spread parse-failure rewards to avoid flat-floor collapse in GRPO."""
+    text = _coerce_completion_text(completion)
+    base_credit = _parse_partial_credit(completion)  # [0, 0.18]
+    lower = -0.95
+    spread = 0.60
+    reward = lower + spread * base_credit
+    # Deterministic micro-jitter keeps rewards non-identical within bad batches.
+    if text:
+        bucket = sum(ord(c) for c in text[:240]) % 41
+        jitter = (bucket / 40.0 - 0.5) * 0.08
+        reward += jitter
+    reward -= _length_budget_penalty(role, text)
+    return round(max(-1.0, min(-0.2, reward)), 4)
 
 
 def _normalized_cross_conflict_penalty(
@@ -164,7 +212,7 @@ def aman_reward_fn(
 
         aman_action = parse_aman_action(completion)
         if aman_action is None:
-            rewards.append(-0.8 + _parse_partial_credit(completion))
+            rewards.append(_controller_failure_reward(completion, "AMAN"))
             continue
 
         dman_slots = _parse_slots_json(dman_json)
@@ -193,13 +241,16 @@ def aman_reward_fn(
                 missing += 1
 
         arr_count = max(1, len(arrivals))
+        emg_total = sum(
+            1 for f in arrivals if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        )
         budget = task.delay_budget / 2.0
         # If all flights are unscheduled, delay_total=0 which would give delay_eff=1.0
         # (rewarding an empty plan). Clamp to 0 when nothing is scheduled.
         _all_arr_missing = missing == len(arrivals) and len(arrivals) > 0
         delay_eff = 0.0 if _all_arr_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / arr_count
-        emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
+        emg_score = emg_ok / max(1, emg_ok + emg_miss) if emg_total > 0 else 0.5
 
         cross_penalty = 0.0
         if {s.runway for s in aman_action.arrival_slots} & {s.runway for s in dman_slots}:
@@ -219,17 +270,27 @@ def aman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        reward = (
-            0.26 * delay_eff
-            + 0.20 * emg_score
-            + 0.17 * coverage
-            + 0.12 * cf_advantage
-            + 0.10 * tom_bonus
-            + 0.05 * sup_align
-            + 0.05 * rationale_score
-            + 0.05 * json_fmt
-            - cross_penalty
+        long_horizon = _weighted_active_mean(
+            [
+                (outcome.metrics.connection_impact_score, 0.45, True),
+                (outcome.metrics.fairness, 0.25, True),
+                (outcome.metrics.fuel_efficiency, 0.20, True),
+                (outcome.metrics.schedule_completeness, 0.10, True),
+            ]
         )
+        reward = _weighted_active_mean(
+            [
+                (delay_eff, 0.22, True),
+                (coverage, 0.18, True),
+                (cf_advantage, 0.15, True),
+                (tom_bonus, 0.10, True),
+                (emg_score, 0.14, emg_total > 0),
+                (sup_align, 0.06, True),
+                (rationale_score, 0.05, True),
+                (json_fmt, 0.04, True),
+                (long_horizon, 0.06, True),
+            ]
+        ) - cross_penalty - _length_budget_penalty("AMAN", completion)
 
         # Layered safety gates — hard ceilings that cannot be bought off by efficiency
         if outcome.metrics.conflict_count > 0:
@@ -303,7 +364,7 @@ def dman_reward_fn(
 
         dman_action = parse_dman_action(completion)
         if dman_action is None:
-            rewards.append(-0.8 + _parse_partial_credit(completion))
+            rewards.append(_controller_failure_reward(completion, "DMAN"))
             continue
 
         aman_slots = _parse_slots_json(aman_json)
@@ -340,12 +401,16 @@ def dman_reward_fn(
                 missing += 1
 
         dep_count = max(1, len(departures))
+        emg_total = sum(
+            1 for f in departures if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        )
         budget = task.delay_budget / 2.0
         _all_dep_missing = missing == len(departures) and len(departures) > 0
         delay_eff = 0.0 if _all_dep_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / dep_count
-        emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
-        atfm_score = atfm_ok / max(1, atfm_ok + atfm_viol) if (atfm_ok + atfm_viol) else 1.0
+        emg_score = emg_ok / max(1, emg_ok + emg_miss) if emg_total > 0 else 0.5
+        atfm_count = atfm_ok + atfm_viol
+        atfm_score = atfm_ok / max(1, atfm_count) if atfm_count > 0 else 0.5
 
         cross_penalty = 0.0
         if {s.runway for s in dman_action.departure_slots} & {s.runway for s in aman_slots}:
@@ -365,18 +430,28 @@ def dman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        reward = (
-            0.23 * delay_eff
-            + 0.17 * atfm_score
-            + 0.16 * emg_score
-            + 0.12 * coverage
-            + 0.12 * cf_advantage
-            + 0.10 * tom_bonus
-            + 0.05 * sup_align
-            + 0.03 * rationale_score
-            + 0.02 * json_fmt
-            - cross_penalty
+        long_horizon = _weighted_active_mean(
+            [
+                (outcome.metrics.connection_impact_score, 0.45, True),
+                (outcome.metrics.fairness, 0.25, True),
+                (outcome.metrics.fuel_efficiency, 0.20, True),
+                (outcome.metrics.schedule_completeness, 0.10, True),
+            ]
         )
+        reward = _weighted_active_mean(
+            [
+                (delay_eff, 0.19, True),
+                (coverage, 0.14, True),
+                (cf_advantage, 0.14, True),
+                (tom_bonus, 0.10, True),
+                (atfm_score, 0.14, atfm_count > 0),
+                (emg_score, 0.12, emg_total > 0),
+                (sup_align, 0.05, True),
+                (rationale_score, 0.04, True),
+                (json_fmt, 0.03, True),
+                (long_horizon, 0.05, True),
+            ]
+        ) - cross_penalty - _length_budget_penalty("DMAN", completion)
 
         # Layered safety gates
         if outcome.metrics.conflict_count > 0:
