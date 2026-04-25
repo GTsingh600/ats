@@ -169,6 +169,57 @@ def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
     return tuned
 
 
+def _prefer_local_model_path(model_name: str) -> str:
+    """Use local HF cache path when available to avoid network flakiness."""
+    if os.path.isdir(model_name):
+        return model_name
+    try:
+        from huggingface_hub import snapshot_download
+
+        local_path = snapshot_download(repo_id=model_name, local_files_only=True)
+        print(f"[INFO] Using local model snapshot cache: {local_path}")
+        return local_path
+    except Exception:
+        return model_name
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "temporary failure in name resolution",
+        "name resolution",
+        "connecterror",
+        "connection error",
+        "failed to establish a new connection",
+    )
+    return any(n in msg for n in needles)
+
+
+def _load_model_with_fallback(
+    FastLanguageModel,
+    model_source: str,
+    *,
+    max_seq_length: int,
+):
+    """Load model/tokenizer, retrying in offline mode on DNS/network failures."""
+    kwargs = {
+        "model_name": model_source,
+        "max_seq_length": max_seq_length,
+        "load_in_4bit": True,
+        "dtype": None,
+    }
+    try:
+        return FastLanguageModel.from_pretrained(**kwargs)
+    except Exception as exc:
+        if not _is_transient_network_error(exc):
+            raise
+        print("[WARN] Network/DNS issue while loading tokenizer/model. Retrying from local cache...")
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        kwargs["local_files_only"] = True
+        return FastLanguageModel.from_pretrained(**kwargs)
+
+
 # ── Role-dispatch table ───────────────────────────────────────────────────────
 
 REWARD_FN_DISPATCH = {
@@ -502,11 +553,11 @@ def train(
 
     # ── 2. Load model ─────────────────────────────────────────────────────────
     print("[1/5] Loading model with Unsloth 4-bit QLoRA...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
+    model_source = _prefer_local_model_path(model_name)
+    model, tokenizer = _load_model_with_fallback(
+        FastLanguageModel,
+        model_source,
         max_seq_length=MAX_SEQ_LEN,
-        load_in_4bit=True,
-        dtype=None,
     )
     # Prevent generate() ambiguity warnings from inherited max_length defaults.
     if hasattr(model, "generation_config") and model.generation_config is not None:
@@ -1073,8 +1124,11 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
     _configure_runtime_warnings()
 
     print(f"\nEvaluating {model_name_or_path} on {n_episodes} episodes...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name_or_path, max_seq_length=MAX_SEQ_LEN, load_in_4bit=True,
+    model_source = _prefer_local_model_path(model_name_or_path)
+    model, tokenizer = _load_model_with_fallback(
+        FastLanguageModel,
+        model_source,
+        max_seq_length=MAX_SEQ_LEN,
     )
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.max_length = None
