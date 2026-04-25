@@ -168,6 +168,7 @@ def _configure_runtime_warnings() -> None:
     for name in (
         "transformers.generation.utils",
         "transformers.generation.configuration_utils",
+        "transformers.modeling_utils",
     ):
         logging.getLogger(name).addFilter(_SuppressMaxLenWarning())
 
@@ -406,9 +407,10 @@ def _maybe_patch_unsloth_args_attrs(trainer) -> None:
         if args is None:
             return
 
-        if not hasattr(args, "delta"):
-            setattr(args, "delta", None)
-            print("[WARN] Applied Unsloth GRPO compatibility shim: args.delta=None")
+        if not hasattr(args, "delta") or getattr(args, "delta", None) is None:
+            # None can crash compiled GRPO paths with NoneType - Tensor arithmetic.
+            setattr(args, "delta", 0.0)
+            print("[WARN] Applied Unsloth GRPO compatibility shim: args.delta=0.0")
 
         if not hasattr(args, "temperature"):
             setattr(args, "temperature", TEMPERATURE)
@@ -457,6 +459,39 @@ def _maybe_patch_nanmin_symbols() -> None:
             print("[WARN] Applied compatibility shim: builtins.nanmax")
     except Exception as exc:
         print(f"[WARN] Could not apply nanmin/nanmax compatibility shim: {exc}")
+
+
+def _preflight_unsloth_grpo_args(trainer) -> None:
+    """Fail-safe normalization for known unstable compiled GRPO argument states."""
+    args = getattr(trainer, "args", None)
+    if args is None:
+        return
+
+    # Ensure arithmetic operands are numeric, never None.
+    if getattr(args, "delta", None) is None:
+        setattr(args, "delta", 0.0)
+        print("[SAFETY] Normalized args.delta=None -> 0.0")
+
+    # If KL is not explicitly forced, keep all KL knobs at zero to avoid
+    # ref_per_token_logps=None paths in this Unsloth/TRL combination.
+    force_kl = os.getenv("ATC_FORCE_KL", "").strip().lower() in {"1", "true", "yes"}
+    if not force_kl:
+        for name in ("beta", "kl_coeff"):
+            if hasattr(args, name) and getattr(args, name) not in (0, 0.0, None):
+                setattr(args, name, 0.0)
+                print(f"[SAFETY] Normalized args.{name} -> 0.0")
+        for name in ("beta", "kl_coeff"):
+            if hasattr(trainer, name) and getattr(trainer, name) not in (0, 0.0, None):
+                setattr(trainer, name, 0.0)
+                print(f"[SAFETY] Normalized trainer.{name} -> 0.0")
+
+    print(
+        "[INFO] GRPO preflight: "
+        f"delta={getattr(args, 'delta', 'n/a')}, "
+        f"beta={getattr(args, 'beta', 'n/a')}, "
+        f"kl_coeff={getattr(args, 'kl_coeff', 'n/a')}, "
+        f"ATC_FORCE_KL={os.getenv('ATC_FORCE_KL', '')!r}"
+    )
 
 
 def _resolve_num_generations(batch_size: int, requested: int) -> int:
@@ -1117,6 +1152,7 @@ def train(
     _maybe_patch_unsloth_runtime_attrs(trainer)
     _maybe_patch_unsloth_args_attrs(trainer)
     _maybe_patch_nanmin_symbols()
+    _preflight_unsloth_grpo_args(trainer)
     
     # ── ADD THIS: Extra safety check for any remaining missing attrs ──
     # Some Unsloth compiled paths access these directly on the trainer
