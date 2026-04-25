@@ -32,6 +32,7 @@ class AgentRole(str, Enum):
     DMAN = "DMAN"
     GENERATOR = "GENERATOR"
     SUPERVISOR = "SUPERVISOR"
+    ADAPT = "ADAPT"
 
 
 # ── Negotiation messaging ─────────────────────────────────────────────────────
@@ -139,6 +140,140 @@ class GeneratorAction(BaseModel):
                    description="Ordered list of mutations to apply to base task")
     strategy:  str = Field(default="",
                    description="High-level explanation of how this breaks coordination")
+
+
+# ── ADAPT agent ───────────────────────────────────────────────────────────────
+
+class ADAPTAction(BaseModel):
+    """ADAPT's domain-to-ATC parameter mapping output.
+
+    Maps entity types (stored in FlightRecord.airline) to ATC wake classes and
+    priority levels so that AMAN/DMAN can operate on a non-ATC domain unchanged.
+    """
+
+    entity_wake_map: Dict[str, str] = Field(
+        ...,
+        description="Maps entity type string to WakeClass value: 'H', 'M', or 'L'",
+    )
+    entity_priority_map: Dict[str, str] = Field(
+        ...,
+        description=(
+            "Maps entity type string to PriorityClass value: "
+            "'normal', 'connection', 'medical', or 'emergency'"
+        ),
+    )
+    rationale: str = Field(
+        default="",
+        description="Explanation of mapping decisions — graded for quality",
+    )
+
+
+class ADAPTObservation(BaseModel):
+    """What ADAPT sees: structural signals from the new domain.
+
+    ADAPT has NO prior domain knowledge. The entity_profiles field exposes
+    domain-agnostic statistics so the agent can reason from data, not labels.
+    """
+
+    role: AgentRole = AgentRole.ADAPT
+    domain_id: str
+    domain_name: str
+    domain_description: str
+    entity_types: List[str]       # unique values from FlightRecord.airline
+    resource_names: List[str]     # shared resource IDs (beds, berths, runways…)
+    sample_entities: str          # first 5 entities rendered as readable text
+    entity_profiles: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Domain-agnostic structural stats per entity type: "
+            "time_pressure, avg_connection_risk, avg_fuel_burn, "
+            "avg_passengers, urgency_in_notes, operation_mix."
+        ),
+    )
+    supervisor_profile_name: SupervisorProfileName
+    supervisor_description: str
+    has_emergencies: bool
+    has_hard_deadlines: bool
+    entity_count: int
+
+    def to_prompt_text(self) -> str:
+        lines = [
+            "=== ADAPT OBSERVATION — Unknown Domain Scheduling Task ===",
+            f"Domain identifier: {self.domain_name}",
+            f"Task ID: {self.domain_id}",
+            "",
+            "DOMAIN DESCRIPTION (as provided by the task):",
+            self.domain_description,
+            "",
+            f"SHARED RESOURCES: {', '.join(self.resource_names)}",
+            f"Total entities to schedule: {self.entity_count}",
+            f"Hard-deadline entities present: {self.has_hard_deadlines}",
+            "",
+            "ENTITY TYPE STRUCTURAL PROFILES",
+            "(All numbers derived from task data — no domain knowledge assumed)",
+            "-" * 60,
+        ]
+
+        for et, p in self.entity_profiles.items():
+            tp  = p.get("time_pressure", 0.0)
+            cr  = p.get("avg_connection_risk", 0.0)
+            ops = p.get("operation_mix", {})
+            ops_str = ", ".join(f"{k}={v}" for k, v in ops.items() if v > 0)
+
+            if tp >= 0.85:
+                tp_label = "VERY TIGHT"
+            elif tp >= 0.60:
+                tp_label = "MODERATE"
+            else:
+                tp_label = "FLEXIBLE"
+
+            if cr >= 0.80:
+                cr_label = "VERY HIGH"
+            elif cr >= 0.50:
+                cr_label = "HIGH"
+            elif cr >= 0.20:
+                cr_label = "MODERATE"
+            else:
+                cr_label = "LOW"
+
+            lines += [
+                f"  {et}  ({p.get('count', 0)} entities — {ops_str}):",
+                f"    time_window    : {p.get('avg_window_minutes', 0):.0f} min avg  "
+                f"[{tp_label}]  time_pressure={tp:.3f}",
+                f"    connection_risk: {cr:.3f}  [{cr_label}]",
+                f"    resource use   : {p.get('avg_fuel_burn', 0):.1f} intensity/min "
+                f"× {p.get('avg_passengers', 0):.0f} units",
+                f"    urgency_in_notes: {'YES ⚠' if p.get('urgency_in_notes') else 'no'}",
+                "",
+            ]
+
+        n = max(1, len(self.entity_profiles))
+        max_emg = 1
+        max_heavy = max(1, n // 3)
+        max_med = max(1, -(-n // 3))   # ceil
+
+        lines += [
+            "-" * 60,
+            f"SUPERVISOR TODAY: {self.supervisor_description}",
+            "",
+            "PRIORITY DISTRIBUTION BUDGET (hard constraint — starvation prevention):",
+            f"  emergency : exactly {max_emg} entity type maximum",
+            f"  H wake    : at most {max_heavy} entity type(s)",
+            f"  medical   : at most {max_med} entity type(s)  (after emergency is assigned)",
+            "  Exceeding these budgets causes AMAN to starve DMAN of runway time.",
+            "  If multiple types qualify for emergency, assign it only to the SINGLE",
+            "  highest urgency scorer and demote the rest to medical.",
+            "",
+            "INSTRUCTIONS:",
+            "1. You do NOT know what domain this is. Reason from the structural numbers.",
+            "2. High time_pressure + high connection_risk → H/emergency mapping.",
+            "3. Flexible windows + low risk → L/normal mapping.",
+            "4. Enforce the budget above — cite budget slot usage in rationale.",
+            "5. Map each entity type to wake_class (H/M/L) and priority "
+            "(emergency/medical/connection/normal).",
+            "6. Cite the specific numbers in your rationale.",
+        ]
+        return "\n".join(lines)
 
 
 # ── Supervisor / Snorkel AI ───────────────────────────────────────────────────

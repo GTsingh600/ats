@@ -241,7 +241,6 @@ def aman_reward_fn(
                 missing += 1
 
         arr_count = max(1, len(arrivals))
-        parsed_slot_count = len(aman_action.arrival_slots)
         emg_total = sum(
             1 for f in arrivals if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
         )
@@ -271,10 +270,6 @@ def aman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        parse_valid_bonus = 0.08
-        slot_validity = min(1.0, parsed_slot_count / arr_count)
-        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
-        long_horizon_gate = max(0.25, parse_progress)
         long_horizon = _weighted_active_mean(
             [
                 (outcome.metrics.connection_impact_score, 0.45, True),
@@ -293,17 +288,17 @@ def aman_reward_fn(
                 (sup_align, 0.06, True),
                 (rationale_score, 0.05, True),
                 (json_fmt, 0.04, True),
-                (long_horizon * long_horizon_gate, 0.06, True),
+                (long_horizon, 0.06, True),
             ]
-        )
-        reward += parse_valid_bonus
-        reward -= cross_penalty
-        reward -= _length_budget_penalty("AMAN", completion)
-        # Smooth safety penalties preserve ranking signal for GRPO.
-        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
-        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
-        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
-        reward -= conflict_penalty + emg_penalty + coverage_penalty
+        ) - cross_penalty - _length_budget_penalty("AMAN", completion)
+
+        # Layered safety gates — hard ceilings that cannot be bought off by efficiency
+        if outcome.metrics.conflict_count > 0:
+            reward = min(reward, 0.30)   # conflict-free gate
+        if emg_miss > 0:
+            reward = min(reward, 0.40)   # emergency hard gate
+        if coverage < 0.50:
+            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -317,13 +312,10 @@ def aman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
-                "parse_valid_bonus": parse_valid_bonus,
-                "slot_validity": slot_validity,
-                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_penalty": -conflict_penalty,
-                "emg_penalty": -emg_penalty,
-                "coverage_penalty": -coverage_penalty,
+                "conflict_gate": int(outcome.metrics.conflict_count > 0),
+                "emg_gate": int(emg_miss > 0),
+                "coverage_floor": int(coverage < 0.50),
                 "final_reward": reward,
             },
         )
@@ -409,7 +401,6 @@ def dman_reward_fn(
                 missing += 1
 
         dep_count = max(1, len(departures))
-        parsed_slot_count = len(dman_action.departure_slots)
         emg_total = sum(
             1 for f in departures if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
         )
@@ -439,10 +430,6 @@ def dman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        parse_valid_bonus = 0.08
-        slot_validity = min(1.0, parsed_slot_count / dep_count)
-        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
-        long_horizon_gate = max(0.25, parse_progress)
         long_horizon = _weighted_active_mean(
             [
                 (outcome.metrics.connection_impact_score, 0.45, True),
@@ -462,16 +449,17 @@ def dman_reward_fn(
                 (sup_align, 0.05, True),
                 (rationale_score, 0.04, True),
                 (json_fmt, 0.03, True),
-                (long_horizon * long_horizon_gate, 0.05, True),
+                (long_horizon, 0.05, True),
             ]
-        )
-        reward += parse_valid_bonus
-        reward -= cross_penalty
-        reward -= _length_budget_penalty("DMAN", completion)
-        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
-        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
-        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
-        reward -= conflict_penalty + emg_penalty + coverage_penalty
+        ) - cross_penalty - _length_budget_penalty("DMAN", completion)
+
+        # Layered safety gates
+        if outcome.metrics.conflict_count > 0:
+            reward = min(reward, 0.30)   # conflict-free gate
+        if emg_miss > 0:
+            reward = min(reward, 0.40)   # emergency hard gate
+        if coverage < 0.50:
+            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -486,13 +474,10 @@ def dman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
-                "parse_valid_bonus": parse_valid_bonus,
-                "slot_validity": slot_validity,
-                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_penalty": -conflict_penalty,
-                "emg_penalty": -emg_penalty,
-                "coverage_penalty": -coverage_penalty,
+                "conflict_gate": int(outcome.metrics.conflict_count > 0),
+                "emg_gate": int(emg_miss > 0),
+                "coverage_floor": int(coverage < 0.50),
                 "final_reward": reward,
             },
         )
@@ -831,3 +816,111 @@ def _extract_supervisor_score(completion: Any) -> Optional[float]:
         if match:
             return float(match.group(1))
     return None
+
+
+def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
+    """Reward ADAPT meta-agent for quality of structural domain transfer."""
+    from multi_agent.adapt import (
+        _build_adapt_heuristic,
+        apply_adapt_mapping,
+        build_adapt_observation,
+        parse_adapt_action,
+    )
+    from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+
+    rewards: List[float] = []
+    n = len(completions)
+
+    domain_task_jsons = kwargs.get("domain_task_json", [None] * n)
+    supervisor_profiles = kwargs.get("supervisor_profile", [None] * n)
+
+    if not isinstance(domain_task_jsons, list):
+        domain_task_jsons = [domain_task_jsons] * n
+    if not isinstance(supervisor_profiles, list):
+        supervisor_profiles = [supervisor_profiles] * n
+
+    for i, completion in enumerate(completions):
+        dtjson = domain_task_jsons[i] if i < len(domain_task_jsons) else None
+        profile = supervisor_profiles[i] if i < len(supervisor_profiles) else None
+
+        if not dtjson:
+            rewards.append(-0.60)
+            continue
+
+        try:
+            domain_task = TaskDefinition.model_validate_json(dtjson)
+        except Exception:
+            rewards.append(-0.60)
+            continue
+
+        action = parse_adapt_action(completion)
+        if action is None:
+            rewards.append(-0.50)
+            continue
+
+        try:
+            prof_enum = SupervisorProfileName(profile) if profile else SupervisorProfileName.SAFETY_STRICT
+        except ValueError:
+            prof_enum = SupervisorProfileName.SAFETY_STRICT
+
+        try:
+            adapt_obs = build_adapt_observation(task=domain_task, profile=prof_enum)
+        except Exception:
+            rewards.append(-0.40)
+            continue
+
+        # Baseline with heuristic ADAPT mapping
+        try:
+            heuristic_action = _build_adapt_heuristic(adapt_obs, domain_task)
+            heuristic_mapped = apply_adapt_mapping(domain_task, heuristic_action)
+            env_base = MultiAgentATCEnvironment(seed=0)
+            aman_obs_b, dman_obs_b = env_base.reset(0, prof_enum, heuristic_mapped)
+            aman_act_b = _build_aman_heuristic(aman_obs_b)
+            dman_act_b = _build_dman_heuristic(dman_obs_b, env_base._state.atfm_deadlines)
+            env_base.step_bid(aman_act_b, dman_act_b)
+            baseline_composite = env_base.finalize().composite_score
+        except Exception:
+            baseline_composite = 0.40
+
+        # LLM ADAPT mapping
+        try:
+            llm_mapped = apply_adapt_mapping(domain_task, action)
+            env_llm = MultiAgentATCEnvironment(seed=0)
+            aman_obs_l, dman_obs_l = env_llm.reset(0, prof_enum, llm_mapped)
+            aman_act_l = _build_aman_heuristic(aman_obs_l)
+            dman_act_l = _build_dman_heuristic(dman_obs_l, env_llm._state.atfm_deadlines)
+            env_llm.step_bid(aman_act_l, dman_act_l)
+            downstream = env_llm.finalize().composite_score
+        except Exception:
+            downstream = 0.0
+
+        entity_types = set(adapt_obs.entity_types)
+        mapped_types = set(action.entity_wake_map.keys()) | set(action.entity_priority_map.keys())
+        coverage = len(entity_types & mapped_types) / max(1, len(entity_types))
+
+        rationale = action.rationale or ""
+        has_numbers = bool(re.search(r"\d+\.\d+", rationale))
+        rationale_bonus = 0.05 if (len(rationale) >= 30 and has_numbers) else 0.0
+
+        improvement = downstream - baseline_composite
+        reward = (
+            0.70 * downstream
+            + 0.15 * max(-1.0, min(1.0, improvement))
+            + 0.10 * coverage
+            + rationale_bonus
+        )
+        reward = max(-1.0, min(1.0, reward))
+        _debug_reward_trace(
+            role="ADAPT",
+            components={
+                "downstream_composite": downstream,
+                "baseline_composite": baseline_composite,
+                "improvement": improvement,
+                "coverage": coverage,
+                "rationale_bonus": rationale_bonus,
+                "total_reward": reward,
+            },
+        )
+        rewards.append(reward)
+
+    return rewards

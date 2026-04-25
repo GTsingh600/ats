@@ -23,12 +23,13 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import OperationType, SlotAssignment
+from models import OperationType, SlotAssignment, TaskDefinition
 from tasks import task_catalog, ordered_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
     AMANAction,
+    ADAPTObservation,
     DMANAction,
     GeneratorAction,
     GeneratorMutation,
@@ -172,6 +173,28 @@ OUTPUT FORMAT (strict JSON, no markdown):
 }}"""
 
 
+ADAPT_SYSTEM = """You are ADAPT (STRUCTURAL Domain Meta-Agent).
+You are given a scheduling task from an UNKNOWN domain (e.g. Hospital ICU, Port Logistics).
+You do NOT know the domain's terminology. You must ignore labels like "TRAUMA" or "BERTH" and focus on:
+1. time_pressure: How narrow is the execution window?
+2. connection_risk: Is this entity part of a sequence (risk of cascade)?
+3. Resource Intensity: How much runway/resource time does it need?
+
+Your job: Map these abstract entities into ATC-specific parameters (Wake Class and Priority)
+so that the existing AMAN/DMAN models can solve the task with zero retraining.
+
+MAPPING GUIDE:
+- Wake Class (H, M, L): Structural separation. Map high-intensity/high-risk to 'H', low to 'L'.
+- Priority (emergency, medical, connection, normal): Sequence urgency. Map highest time pressure to 'emergency'.
+
+OUTPUT FORMAT (strict JSON, no markdown):
+{
+  "entity_wake_map": {"ENTITY_TYPE_A": "H|M|L", "ENTITY_TYPE_B": "..."},
+  "entity_priority_map": {"ENTITY_TYPE_A": "emergency|medical|connection|normal", ...},
+  "rationale": "Explain using NUMERICAL structural signals (time pressure, risk) why you chose these mappings."
+}"""
+
+
 # ── Dataset builder ───────────────────────────────────────────────────────────
 
 def build_episode_dataset(
@@ -179,6 +202,8 @@ def build_episode_dataset(
     seed: int = 42,
     include_generator: bool = True,
     include_supervisor: bool = True,
+    include_adapt: bool = True,
+    domain_episode_ratio: float = 0.30,
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
 
@@ -198,6 +223,20 @@ def build_episode_dataset(
     samples: List[Dict[str, Any]] = []
 
     for ep_id in range(n_episodes):
+        # ── ADAPT domain sample (stochastic) ────────────────────────────────
+        if include_adapt and rng.random() < domain_episode_ratio:
+            from domains import get_all_domain_tasks
+            from multi_agent.adapt import build_adapt_observation
+
+            domain_tasks = get_all_domain_tasks()
+            if domain_tasks:
+                tid = rng.choice(list(domain_tasks.keys()))
+                dtask = domain_tasks[tid]
+                profile = supervisor.sample_profile(ep_id)
+                obs = build_adapt_observation(dtask, profile)
+                samples.append(_make_adapt_sample(ep_id, obs, dtask))
+                continue
+
         base_task = rng.choice(task_list)
         profile = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
@@ -393,6 +432,20 @@ def _build_reference_merged_plan_json(task) -> str:
     return json.dumps(slots)
 
 
+def _make_adapt_sample(ep_id: int, obs: ADAPTObservation, domain_task: TaskDefinition) -> Dict[str, Any]:
+    return {
+        "prompt": [
+            {"role": "system", "content": ADAPT_SYSTEM},
+            {"role": "user", "content": obs.to_prompt_text()},
+        ],
+        "task_id": "domain_transfer",
+        "agent_role": AgentRole.ADAPT.value,
+        "round": "adapt",
+        "domain_task_json": domain_task.model_dump_json(),
+        "supervisor_profile": obs.supervisor_profile_name.value,
+    }
+
+
 # ── Action parsers (completion → typed action) ────────────────────────────────
 
 def _coerce_completion_text(completion: Any) -> str:
@@ -430,53 +483,17 @@ def _extract_json(text: Any) -> Optional[str]:
     text = re.sub(r"```[a-zA-Z]*\s*", "", text)
     text = re.sub(r"```", "", text).strip()
 
-    candidates = _extract_balanced_json_candidates(text)
-    for raw in candidates:
-        # Normalise Python literals so json.loads can parse them
-        # Use word-boundary replacements to avoid mangling string values
-        norm = re.sub(r"\bTrue\b", "true", raw)
-        norm = re.sub(r"\bFalse\b", "false", norm)
-        norm = re.sub(r"\bNone\b", "null", norm)
-        if _loads_lenient(norm) is not None:
-            return norm
-    return None
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
 
-
-def _extract_balanced_json_candidates(text: str) -> List[str]:
-    """Extract balanced {...} object candidates from a completion."""
-    candidates: List[str] = []
-    start = None
-    depth = 0
-    in_string = False
-    escape = False
-    for idx, ch in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = idx
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    candidates.append(text[start : idx + 1])
-                    start = None
-    if not candidates:
-        # Fallback keeps previous behavior when braces are malformed.
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            candidates.append(match.group(0))
-    return candidates
+    raw = match.group(0)
+    # Normalise Python literals so json.loads can parse them
+    # Use word-boundary replacements to avoid mangling string values
+    raw = re.sub(r"\bTrue\b",  "true",  raw)
+    raw = re.sub(r"\bFalse\b", "false", raw)
+    raw = re.sub(r"\bNone\b",  "null",  raw)
+    return raw
 
 
 def _loads_lenient(raw: str) -> Optional[dict]:
