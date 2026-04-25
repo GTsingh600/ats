@@ -965,6 +965,135 @@ def plot_eval_comparison(eval_results: Dict, save_dir: Optional[str] = None, sho
     plt.close()
 
 
+def _eval_metric_get(d: dict, *keys: str) -> float:
+    for k in keys:
+        if k in d:
+            try:
+                return float(d[k])
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+EVAL_METRIC_SPECS: List[Tuple[str, str, str]] = [
+    ("Composite Score", "mean_composite", "mean_composite"),
+    ("AMAN Reward", "mean_aman", "mean_aman_reward"),
+    ("DMAN Reward", "mean_dman", "mean_dman_reward"),
+    ("Coordination Score", "mean_coord", "mean_coordination"),
+    ("Success Rate", "success_rate", "success_rate"),
+]
+
+
+def plot_ablation_eval_bars(
+    baseline: Dict[str, Any],
+    trained_runs: List[Tuple[str, Dict[str, Any]]],
+    save_dir: str | Path,
+    *,
+    title: str = "Ablation: same baseline vs GRPO runs",
+    show: bool = False,
+) -> Optional[Path]:
+    """Grouped bars: one shared baseline + one trained dict per run label."""
+    if not baseline or not trained_runs:
+        return None
+    try:
+        import matplotlib
+        if not show:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[ERROR] pip install matplotlib numpy")
+        return None
+
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 9,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "figure.dpi": 150,
+        }
+    )
+    labels = [m[0] for m in EVAL_METRIC_SPECS]
+    base_v = [_eval_metric_get(baseline, m[1], m[2]) for m in EVAL_METRIC_SPECS]
+    run_vals: List[List[float]] = []
+    for _, tr in trained_runs:
+        run_vals.append([_eval_metric_get(tr, m[1], m[2]) for m in EVAL_METRIC_SPECS])
+
+    x = np.arange(len(labels))
+    n_bars = 1 + len(trained_runs)
+    width = min(0.22, 0.9 / (n_bars + 0.5))
+    offsets = np.linspace(-(n_bars - 1) * width / 2, (n_bars - 1) * width / 2, n_bars)
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    ax.bar(x + offsets[0], base_v, width, label="Baseline (pre-GRPO eval)", color="#90A4AE", alpha=0.9)
+    colors = ["#1565C0", "#2E7D32", "#6A1B9A", "#C62828", "#00838F"]
+    for j, ((name, _), vals) in enumerate(zip(trained_runs, run_vals)):
+        ax.bar(x + offsets[j + 1], vals, width, label=name, color=colors[j % len(colors)], alpha=0.88)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=18, ha="right")
+    ax.set_ylabel("Score (0–1)")
+    ax.set_ylim(0, 1.2)
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=10)
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.axhline(0.6, color="#FF8F00", linestyle="--", linewidth=1.0, alpha=0.8)
+    plt.tight_layout()
+    dest = Path(save_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / "ablation_eval_bars.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved: {out}")
+    if show:
+        plt.show()
+    plt.close()
+    return out
+
+
+def plot_ablation_composite_overlay(
+    curves: List[Tuple[str, Dict[str, List[float]]]],
+    save_dir: str | Path,
+    *,
+    show: bool = False,
+) -> Optional[Path]:
+    """Overlay smoothed composite reward for several ``reward_curves.json`` payloads."""
+    if len(curves) < 2:
+        return None  # need at least two curves to compare
+    plt = _setup_matplotlib(show)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    colors = ["#1565C0", "#2E7D32", "#6A1B9A", "#C62828", "#00838F"]
+    drew = False
+    for j, (name, data) in enumerate(curves):
+        comp = data.get("composite") or []
+        if len(comp) < 2:
+            continue
+        sm = _smooth([float(x) for x in comp], window=15)
+        xs = list(range(len(sm)))
+        ax.plot(xs, sm, label=name, color=colors[j % len(colors)], linewidth=2)
+        drew = True
+    if not drew:
+        plt.close()
+        return None
+    ax.set_xlabel("Training step (per-sample composite index)")
+    ax.set_ylabel("Composite (EMA)")
+    ax.set_title("Ablation: composite training curves overlaid", fontsize=12, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-0.05, 1.05)
+    plt.tight_layout()
+    dest = Path(save_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / "ablation_composite_overlay.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved: {out}")
+    if show:
+        plt.show()
+    plt.close()
+    return out
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:

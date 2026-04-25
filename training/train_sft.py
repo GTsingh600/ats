@@ -136,7 +136,7 @@ def main() -> None:
         "dataset_text_field": "text",
         "max_seq_length": int(min(4096, MAX_SEQ_LEN)),
         "save_strategy": "steps",
-        "save_steps": max(50, int(args.max_steps) // 4),
+        "save_steps": max(1, min(max(50, int(args.max_steps) // 4), int(args.max_steps))),
         "save_total_limit": 2,
     }
     sig = inspect.signature(SFTConfig.__init__).parameters

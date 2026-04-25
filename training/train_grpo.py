@@ -319,6 +319,95 @@ def _maybe_patch_trainer_sampler(trainer) -> None:
         print(f"[WARN] Could not apply sampler compatibility shim: {exc}")
 
 
+def _maybe_force_sequential_train_sampler(trainer, *, strict_roster: bool) -> None:
+    """Unsloth/TRL may ignore ``shuffle_train_dataset=False``; force roster pack order."""
+    if not strict_roster:
+        return
+    try:
+        from types import MethodType
+
+        from torch.utils.data import SequentialSampler
+
+        def _sequential_train_sampler(self, train_dataset=None):
+            ds = train_dataset if train_dataset is not None else self.train_dataset
+            return SequentialSampler(ds)
+
+        trainer._get_train_sampler = MethodType(_sequential_train_sampler, trainer)
+        print(
+            "[STRICT_ROSTER] Forced SequentialSampler (ignores shuffle; keeps 6-role packs contiguous)."
+        )
+    except Exception as exc:
+        print(f"[WARN] Could not force SequentialSampler: {exc}")
+
+
+def _as_agent_role_list(role_val: Any) -> List[str]:
+    """Batch ``agent_role`` column → Python ``str`` list (handles tensor/ndarray)."""
+    if role_val is None:
+        return []
+    if isinstance(role_val, (list, tuple)):
+        return [str(x) for x in role_val]
+    try:
+        import numpy as np
+
+        if isinstance(role_val, np.ndarray):
+            return [str(x) for x in role_val.tolist()]
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if isinstance(role_val, torch.Tensor):
+            return [str(x) for x in role_val.detach().cpu().tolist()]
+    except Exception:
+        pass
+    return [str(role_val)]
+
+
+def _coerce_scalar_list(values: Any) -> List[Any]:
+    """Turn ``difficulty_scalar``-like batch fields into a flat list."""
+    if values is None:
+        return []
+    if isinstance(values, (list, tuple)):
+        return list(values)
+    try:
+        import numpy as np
+
+        if isinstance(values, np.ndarray):
+            return values.tolist()
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().tolist()
+    except Exception:
+        pass
+    return [values]
+
+
+def _expand_kw_to_completions(n_completions: int, seq: List[Any], *, name: str) -> List[Any]:
+    """Repeat each entry ``G`` times when TRL stacks ``G`` completions per dataset row (GRPO)."""
+    if n_completions <= 0:
+        return []
+    if not seq:
+        return [None] * n_completions
+    base = len(seq)
+    if base == n_completions:
+        return list(seq)
+    if n_completions % base == 0:
+        g = n_completions // base
+        out: List[Any] = []
+        for x in seq:
+            out.extend([x] * g)
+        return out
+    print(
+        f"[WARN] {name}: len={base} does not divide n_completions={n_completions}; "
+        "padding with last value (roster assert may still fail if the base batch is wrong)."
+    )
+    return list(seq) + [seq[-1]] * (n_completions - base)
+
+
 def _maybe_patch_unsloth_grad_accum(trainer) -> None:
     """Provide missing attribute expected by some Unsloth GRPO trainer builds."""
     if hasattr(trainer, "current_gradient_accumulation_steps"):
@@ -602,13 +691,10 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     TRL GRPOTrainer calls this with a batch of completions.
     kwargs contains per-sample metadata from the dataset.
     """
-    roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
-    if not isinstance(roles, list):
-        roles = [roles] * len(completions)
-    elif len(roles) < len(completions):
-        roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (
-            len(completions) - len(roles)
-        )
+    roles = _as_agent_role_list(kwargs.get("agent_role"))
+    if not roles:
+        roles = [AgentRole.AMAN.value] * len(completions)
+    roles = _expand_kw_to_completions(len(completions), roles, name="agent_role")
 
     rewards: List[float] = []
     failure_mode = _reward_failure_mode()
@@ -646,6 +732,7 @@ def train(
     use_grounded_curriculum: bool = False,
     curriculum_state_path: Optional[str] = None,
     adapter_in: Optional[str] = None,
+    max_steps: Optional[int] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -792,6 +879,12 @@ def train(
     from training.live_curriculum import live_max_steps as _live_max_steps
 
     computed_max_steps = _live_max_steps(n_episodes, batch_size, grad_accum)
+    if max_steps is not None:
+        cap = max(1, int(max_steps))
+        derived = int(computed_max_steps)
+        computed_max_steps = min(derived, cap)
+        if computed_max_steps != derived:
+            print(f"[INFO] max_steps cap: curriculum-derived {derived} -> {computed_max_steps}")
 
     if grounded_live:
         if curriculum_state_path:
@@ -1129,15 +1222,24 @@ def train(
                         flattened.append(str(c))
                 completions = flattened
 
+            # GRPO stacks ``num_generations`` completions per dataset row; TRL keeps one
+            # ``agent_role`` (and difficulty) per row unless we expand here. Padding with
+            # the last role used to break strict roster asserts (e.g. 3×DMAN + 3×SUP).
+            kwargs = dict(kwargs)
+            _n = len(completions)
+            _base_roles = _as_agent_role_list(kwargs.get("agent_role"))
+            if not _base_roles:
+                print("[WARN] batch missing agent_role metadata; rewards may be mis-routed.")
+                _base_roles = [AgentRole.AMAN.value]
+            kwargs["agent_role"] = _expand_kw_to_completions(_n, _base_roles, name="agent_role")
+            if "difficulty_scalar" in kwargs:
+                kwargs["difficulty_scalar"] = _expand_kw_to_completions(
+                    _n, _coerce_scalar_list(kwargs.get("difficulty_scalar")), name="difficulty_scalar"
+                )
+
             rewards = combined_reward_fn(completions, **kwargs)
 
-            roles = kwargs.get("agent_role", [])
-            if not isinstance(roles, list):
-                roles = [roles] * len(rewards)
-            elif len(roles) < len(rewards):
-                roles = roles + [
-                    roles[-1] if roles else AgentRole.AMAN.value
-                ] * (len(rewards) - len(roles))
+            roles = kwargs["agent_role"]
 
             if strict_roster and len(roles) == len(rewards) and rewards:
                 assert_batch_role_counts(
@@ -1402,6 +1504,7 @@ def train(
     
     # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
     _maybe_patch_trainer_sampler(trainer)
+    _maybe_force_sequential_train_sampler(trainer, strict_roster=strict_roster)
     _maybe_patch_unsloth_grad_accum(trainer)
     _maybe_patch_unsloth_loss_type(trainer)
     _maybe_patch_unsloth_runtime_attrs(trainer)
@@ -1908,6 +2011,12 @@ def main() -> None:
         default=None,
         help="Directory with a prior LoRA adapter (e.g. outputs/atc-sft-json from train_sft.py).",
     )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Cap GRPO optimizer steps (dev/smoke). Default: derived from --episodes and batch layout.",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -1948,6 +2057,7 @@ def main() -> None:
             use_grounded_curriculum=bool(args.grounded_curriculum),
             curriculum_state_path=args.curriculum_state,
             adapter_in=args.adapter_in,
+            max_steps=args.max_steps,
         )
 
 
