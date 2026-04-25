@@ -164,7 +164,7 @@ def aman_reward_fn(
 
         aman_action = parse_aman_action(completion)
         if aman_action is None:
-            rewards.append(-0.8)
+            rewards.append(-0.8 + _parse_partial_credit(completion))
             continue
 
         dman_slots = _parse_slots_json(dman_json)
@@ -194,7 +194,10 @@ def aman_reward_fn(
 
         arr_count = max(1, len(arrivals))
         budget = task.delay_budget / 2.0
-        delay_eff = max(0.0, 1.0 - delay_total / max(1, budget))
+        # If all flights are unscheduled, delay_total=0 which would give delay_eff=1.0
+        # (rewarding an empty plan). Clamp to 0 when nothing is scheduled.
+        _all_arr_missing = missing == len(arrivals) and len(arrivals) > 0
+        delay_eff = 0.0 if _all_arr_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / arr_count
         emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
 
@@ -300,7 +303,7 @@ def dman_reward_fn(
 
         dman_action = parse_dman_action(completion)
         if dman_action is None:
-            rewards.append(-0.8)
+            rewards.append(-0.8 + _parse_partial_credit(completion))
             continue
 
         aman_slots = _parse_slots_json(aman_json)
@@ -338,7 +341,8 @@ def dman_reward_fn(
 
         dep_count = max(1, len(departures))
         budget = task.delay_budget / 2.0
-        delay_eff = max(0.0, 1.0 - delay_total / max(1, budget))
+        _all_dep_missing = missing == len(departures) and len(departures) > 0
+        delay_eff = 0.0 if _all_dep_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / dep_count
         emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
         atfm_score = atfm_ok / max(1, atfm_ok + atfm_viol) if (atfm_ok + atfm_viol) else 1.0
@@ -513,6 +517,32 @@ def _json_format_score(completion: Any) -> float:
         if "{" in text and ("slots" in text or "rationale" in text):
             return 0.2
         return 0.0
+
+
+def _parse_partial_credit(completion: Any) -> float:
+    """Partial credit when JSON parsing fails, preventing GRPO advantage collapse.
+
+    When all completions in a GRPO group fail to parse, returning the same -0.8
+    makes group std=0 → advantage=0 → zero gradient. This function returns
+    0.0–0.18 based on structural quality, keeping rewards in [-0.80, -0.62].
+    """
+    text = _coerce_completion_text(completion)
+    if not text:
+        return 0.0
+    score = 0.0
+    if "{" in text:
+        score += 0.04
+    if any(k in text for k in ('"slots"', '"arrival_slots"', '"departure_slots"')):
+        score += 0.05
+    if '"flight_id"' in text:
+        score += 0.04
+    if '"runway"' in text:
+        score += 0.03
+    if '"rationale"' in text:
+        score += 0.02
+    if len(text.strip()) < 30:
+        score = max(0.0, score - 0.04)
+    return round(min(0.18, score), 4)
 
 
 def _score_rationale_quality(

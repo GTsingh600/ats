@@ -97,7 +97,7 @@ LORA_ALPHA     = 32
 LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
 MAX_SEQ_LEN    = 4096
 MAX_NEW_TOKENS = 512
-TEMPERATURE    = 0.7
+TEMPERATURE    = 0.9   # higher temp → more diverse GRPO rollouts → non-zero group std
 # 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
 # With N=2 the group std is near-zero, making the normalised advantage meaningless.
 N_GENERATIONS  = 4
