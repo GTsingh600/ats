@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import logging
 import os
 import sys
 import time
@@ -129,6 +130,17 @@ def _configure_runtime_warnings() -> None:
         message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*deprecated.*",
         category=FutureWarning,
     )
+    # Some transformers builds emit this through logging, not warnings.
+    class _SuppressMaxLenWarning(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return "Both `max_new_tokens`" not in msg
+
+    for name in (
+        "transformers.generation.utils",
+        "transformers.generation.configuration_utils",
+    ):
+        logging.getLogger(name).addFilter(_SuppressMaxLenWarning())
 
 
 def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
@@ -453,6 +465,7 @@ def train(
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
+    from transformers import TrainerCallback
 
     tuned = _auto_tune_for_gpu(torch)
     batch_size = tuned["batch_size"]
@@ -495,6 +508,9 @@ def train(
         load_in_4bit=True,
         dtype=None,
     )
+    # Prevent generate() ambiguity warnings from inherited max_length defaults.
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.max_length = None
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_rank,
@@ -666,7 +682,7 @@ def train(
 
     trainer = GRPOTrainer(**trainer_kwargs)
 
-    class LiveMetricsCallback:
+    class LiveMetricsCallback(TrainerCallback):
         """Stream concise live metrics into notebook/stdout while training."""
 
         def on_log(self, args, state, control, logs=None, **kwargs):
@@ -700,7 +716,15 @@ def train(
             )
 
     if hasattr(trainer, "add_callback"):
-        trainer.add_callback(LiveMetricsCallback())
+        live_cb = LiveMetricsCallback()
+        # Fail fast before trainer.train() if callback API is incompatible.
+        missing = [name for name in ("on_train_begin", "on_log", "on_train_end") if not hasattr(live_cb, name)]
+        if missing:
+            raise RuntimeError(
+                "LiveMetricsCallback is incompatible with Trainer API; "
+                f"missing methods: {missing}"
+            )
+        trainer.add_callback(live_cb)
     
     # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
     _maybe_patch_trainer_sampler(trainer)
@@ -863,8 +887,10 @@ class _LocalModelClient:
     def __init__(self, model, tokenizer):
         self._model = model
         self._tokenizer = tokenizer
+        if hasattr(self._model, "generation_config") and self._model.generation_config is not None:
+            self._model.generation_config.max_length = None
 
-    def _create(self, *, model=None, messages, temperature=0.3, max_tokens=512, **kw):
+    def _create(self, *, model=None, messages, temperature=0.3, max_tokens=MAX_NEW_TOKENS, **kw):
         import torch
         prompt = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -877,7 +903,7 @@ class _LocalModelClient:
                 with torch.autocast(device_type="cuda", dtype=cast_dtype):
                     out = self._model.generate(
                         **inputs,
-                        max_new_tokens=min(int(max_tokens), 512),
+                        max_new_tokens=min(int(max_tokens), MAX_NEW_TOKENS),
                         temperature=max(float(temperature), 0.01),
                         do_sample=float(temperature) > 0.01,
                         pad_token_id=self._tokenizer.eos_token_id,
@@ -885,7 +911,7 @@ class _LocalModelClient:
             else:
                 out = self._model.generate(
                     **inputs,
-                    max_new_tokens=min(int(max_tokens), 512),
+                    max_new_tokens=min(int(max_tokens), MAX_NEW_TOKENS),
                     temperature=max(float(temperature), 0.01),
                     do_sample=float(temperature) > 0.01,
                     pad_token_id=self._tokenizer.eos_token_id,
@@ -1047,6 +1073,8 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name_or_path, max_seq_length=MAX_SEQ_LEN, load_in_4bit=True,
     )
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.max_length = None
     FastLanguageModel.for_inference(model)
 
     import random
