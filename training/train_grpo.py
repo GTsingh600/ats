@@ -527,6 +527,7 @@ def train(
     push_to_hub:  bool = False,
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
+    eval_episodes: int = 3,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -548,6 +549,8 @@ def train(
     print(f"  ATC Multi-Agent GRPO Training")
     print(f"  Model:        {model_name}")
     print(f"  Episodes:     {n_episodes}")
+    if run_eval:
+        print(f"  Eval episodes:{max(1, int(eval_episodes))}")
     print(f"  Generations:  {num_generations} per prompt")
     print(f"  Output:       {output_dir}")
     device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -603,7 +606,7 @@ def train(
         print("\n[1.5/5] Measuring base model score (untrained LoRA)...")
         model.eval()
         base_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="BASE MODEL (no fine-tune)"
+            model, tokenizer, n_episodes=max(1, int(eval_episodes)), tag="BASE MODEL (no fine-tune)"
         )
         model.train()
         _save_json(base_model_metrics, Path(output_dir) / "base_model_metrics.json")
@@ -780,6 +783,8 @@ def train(
 
     class LiveMetricsCallback(TrainerCallback):
         """Stream concise live metrics into notebook/stdout while training."""
+        def __init__(self):
+            self._zero_std_streak = 0
 
         def on_log(self, args, state, control, logs=None, **kwargs):
             logs = logs or {}
@@ -789,6 +794,7 @@ def train(
             max_steps = int(getattr(state, "max_steps", 0) or 0)
             loss = logs.get("loss")
             lr = logs.get("learning_rate")
+            rstd = logs.get("reward_std")
 
             def _avg_last(key: str, window: int = 64) -> float:
                 vals = reward_log.get(key, [])
@@ -814,6 +820,14 @@ def train(
             sup = _avg_last("SUPERVISOR")
             p_aman = _parse_rate("AMAN")
             p_dman = _parse_rate("DMAN")
+            try:
+                rstd_val = float(rstd) if rstd is not None else float("nan")
+            except Exception:
+                rstd_val = float("nan")
+            if rstd_val == rstd_val and rstd_val <= 1e-9:
+                self._zero_std_streak += 1
+            elif rstd_val == rstd_val:
+                self._zero_std_streak = 0
             print(
                 "[LIVE] "
                 f"step={step}/{max_steps} "
@@ -821,7 +835,8 @@ def train(
                 f"lr={lr if lr is not None else 'n/a'} "
                 f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
                 f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
-                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)}]"
+                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)}] "
+                f"rstd={_fmt(rstd_val)} zstd_streak={self._zero_std_streak}"
             )
 
     if hasattr(trainer, "add_callback"):
@@ -887,7 +902,7 @@ def train(
         print("\n[Post] Measuring trained model score...")
         FastLanguageModel.for_inference(model)  # fuse LoRA weights for faster generation
         trained_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="TRAINED MODEL"
+            model, tokenizer, n_episodes=max(1, int(eval_episodes)), tag="TRAINED MODEL"
         )
         _save_json(trained_model_metrics, Path(output_dir) / "trained_model_metrics.json")
 
@@ -1290,6 +1305,8 @@ def main() -> None:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--temperature",    type=float, default=None)
     parser.add_argument("--logging_steps",  type=int, default=None)
+    parser.add_argument("--eval_episodes",  type=int, default=3,
+                        help="Episodes for pre/post training eval runs.")
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
     parser.add_argument("--eval_only",      action="store_true")
@@ -1318,7 +1335,7 @@ def main() -> None:
         LOGGING_STEPS = max(1, args.logging_steps)
 
     if args.eval_only:
-        evaluate(args.model, n_episodes=20, seed=args.seed)
+        evaluate(args.model, n_episodes=max(1, int(args.eval_episodes)), seed=args.seed)
     else:
         train(
             model_name=args.model,
@@ -1329,6 +1346,7 @@ def main() -> None:
             push_to_hub=args.push_to_hub,
             hub_model_id=args.hub_model_id,
             run_eval=not args.no_eval,
+            eval_episodes=max(1, int(args.eval_episodes)),
         )
 
 

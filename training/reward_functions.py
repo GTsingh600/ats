@@ -144,6 +144,35 @@ def _controller_failure_reward(completion: Any, role: str) -> float:
     return round(max(-1.0, min(-0.2, reward)), 4)
 
 
+def _slot_structural_quality(
+    task: TaskDefinition,
+    slots: List[SlotAssignment],
+    *,
+    operation: OperationType,
+) -> float:
+    """Role-local quality signal to reduce reward collapse in near-tie plans."""
+    expected = [f for f in task.flights if f.operation == operation]
+    if not expected:
+        return 0.5
+    by_id = {s.flight_id: s for s in slots}
+    assigned = 0
+    runway_ok = 0
+    window_ok = 0
+    for f in expected:
+        s = by_id.get(f.flight_id)
+        if s is None:
+            continue
+        assigned += 1
+        if s.runway in f.allowed_runways:
+            runway_ok += 1
+        if f.earliest_minute <= s.assigned_minute <= f.latest_minute:
+            window_ok += 1
+    assign_ratio = assigned / max(1, len(expected))
+    runway_ratio = runway_ok / max(1, assigned)
+    window_ratio = window_ok / max(1, assigned)
+    return max(0.0, min(1.0, 0.45 * assign_ratio + 0.30 * runway_ratio + 0.25 * window_ratio))
+
+
 def _normalized_cross_conflict_penalty(
     our_slots: List[SlotAssignment],
     other_slots: List[SlotAssignment],
@@ -263,6 +292,11 @@ def aman_reward_fn(
         tom_bonus = _compute_tom_bonus_aman(aman_action, dman_slots, task)
         sup_align = _supervisor_alignment(outcome, task, profile)
         rationale_score = _score_rationale_quality(aman_action.rationale, task, outcome)
+        slot_quality = _slot_structural_quality(
+            task,
+            aman_action.arrival_slots,
+            operation=OperationType.ARRIVAL,
+        )
 
         # Counterfactual credit: how much does AMAN's plan improve over naive baseline?
         # cf_outcome = naive arrivals + real DMAN slots; advantage = real - counterfactual.
@@ -289,6 +323,7 @@ def aman_reward_fn(
                 (rationale_score, 0.05, True),
                 (json_fmt, 0.04, True),
                 (long_horizon, 0.06, True),
+                (slot_quality, 0.06, True),
             ]
         ) - cross_penalty - _length_budget_penalty("AMAN", completion)
 
@@ -311,6 +346,7 @@ def aman_reward_fn(
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
+                "slot_quality": slot_quality,
                 "json_fmt": json_fmt,
                 "cross_penalty": -cross_penalty,
                 "conflict_gate": int(outcome.metrics.conflict_count > 0),
@@ -423,6 +459,11 @@ def dman_reward_fn(
         tom_bonus = _compute_tom_bonus_dman(dman_action, aman_slots, task)
         sup_align = _supervisor_alignment(outcome, task, profile)
         rationale_score = _score_rationale_quality(dman_action.rationale, task, outcome)
+        slot_quality = _slot_structural_quality(
+            task,
+            dman_action.departure_slots,
+            operation=OperationType.DEPARTURE,
+        )
 
         # Counterfactual credit: how much does DMAN's plan improve over naive baseline?
         # cf_outcome = real AMAN slots + naive departures; advantage = real - counterfactual.
@@ -450,6 +491,7 @@ def dman_reward_fn(
                 (rationale_score, 0.04, True),
                 (json_fmt, 0.03, True),
                 (long_horizon, 0.05, True),
+                (slot_quality, 0.07, True),
             ]
         ) - cross_penalty - _length_budget_penalty("DMAN", completion)
 
@@ -473,6 +515,7 @@ def dman_reward_fn(
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
+                "slot_quality": slot_quality,
                 "json_fmt": json_fmt,
                 "cross_penalty": -cross_penalty,
                 "conflict_gate": int(outcome.metrics.conflict_count > 0),
