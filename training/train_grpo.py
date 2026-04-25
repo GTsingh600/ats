@@ -733,6 +733,8 @@ def train(
     curriculum_state_path: Optional[str] = None,
     adapter_in: Optional[str] = None,
     max_steps: Optional[int] = None,
+    mid_eval_every: int = 0,
+    mid_eval_episodes: Optional[int] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -848,6 +850,8 @@ def train(
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"    LoRA rank={lora_rank}, trainable params: {trainable:,}")
 
+    print(f"[VRAM] {_vram_snapshot(torch)}")
+
     # ── 2b. Base model eval (before any gradient steps) ──────────────────────
     base_model_metrics: Optional[Dict[str, Any]] = None
     eval_task_ids = sorted(holdout_task_ids) if holdout_task_ids else None
@@ -878,7 +882,14 @@ def train(
     )
     from training.live_curriculum import live_max_steps as _live_max_steps
 
-    computed_max_steps = _live_max_steps(n_episodes, batch_size, grad_accum)
+    try:
+        _live_passes = float(os.environ.get("ATC_LIVE_PASSES", "2.5").strip() or "2.5")
+    except ValueError:
+        _live_passes = 2.5
+    _live_passes = max(1.0, min(5.0, _live_passes))
+    computed_max_steps = _live_max_steps(n_episodes, batch_size, grad_accum, passes=_live_passes)
+    if _live_passes != 2.5:
+        print(f"[INFO] ATC_LIVE_PASSES={_live_passes} (live_max_steps / materialized row budget)")
     if max_steps is not None:
         cap = max(1, int(max_steps))
         derived = int(computed_max_steps)
@@ -1047,6 +1058,11 @@ def train(
         f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, kl={kl_coeff}, "
         f"warmup_steps={warmup_steps})..."
     )
+    save_steps_eff = max(1, _env_int("ATC_SAVE_STEPS", SAVE_STEPS))
+    save_total_eff = max(1, _env_int("ATC_SAVE_TOTAL_LIMIT", SAVE_TOTAL_LIMIT))
+    if curriculum_manager is not None:
+        save_steps_eff = min(save_steps_eff, max(1, int(computed_max_steps)))
+
     grpo_kwargs: Dict[str, Any] = {
         "num_generations":              num_generations,
         "temperature":                  TEMPERATURE,
@@ -1055,8 +1071,8 @@ def train(
         "gradient_accumulation_steps":  grad_accum,
         "lr_scheduler_type":            "cosine",
         "logging_steps":                LOGGING_STEPS,
-        "save_steps":                   SAVE_STEPS,
-        "save_total_limit":             SAVE_TOTAL_LIMIT,
+        "save_steps":                   save_steps_eff,
+        "save_total_limit":             save_total_eff,
         "output_dir":                   output_dir,
         "run_name":                     f"atc-multiagent-grpo-{int(time.time())}",
         "bf16":                         torch.cuda.is_bf16_supported(),
@@ -1106,6 +1122,7 @@ def train(
         print("[STRICT_ROSTER] shuffle_train_dataset=False (preserve roster packs)")
 
     grpo_config = GRPOConfig(**grpo_kwargs)
+    print(f"    checkpoint save: save_steps={save_steps_eff} save_total_limit={save_total_eff}")
 
     # ── 5. Per-role reward logger ─────────────────────────────────────────────
     print("\n[4/5] Setting up per-role reward logging...")
@@ -1391,6 +1408,30 @@ def train(
 
     reward_logger = RewardLogger()
 
+    mid_eval_every_eff = int(mid_eval_every)
+    if mid_eval_every_eff <= 0:
+        mid_eval_every_eff = _env_int("ATC_MID_EVAL_EVERY", 0)
+    if mid_eval_every_eff > 0 and mid_eval_every_eff < 50:
+        print(
+            f"[WARN] mid_eval_every={mid_eval_every_eff} < 50 burns time on noisy probes; clamping to 50."
+        )
+        mid_eval_every_eff = 50
+    mid_eval_eps_final = 0
+    if mid_eval_every_eff > 0:
+        raw_me_eps = (
+            int(mid_eval_episodes)
+            if mid_eval_episodes is not None
+            else _env_int("ATC_MID_EVAL_EPISODES", 0)
+        )
+        if raw_me_eps <= 0:
+            raw_me_eps = max(50, int(eval_episodes))
+        mid_eval_eps_final = max(50, raw_me_eps)
+        print(
+            f"[MID_EVAL] periodic eval enabled: every {mid_eval_every_eff} optimizer steps, "
+            f"n_episodes={mid_eval_eps_final} (same _run_model_episodes as post-train; "
+            f"<50 episodes is too noisy to be worth the GPU time)"
+        )
+
     # ── 6. Train ──────────────────────────────────────────────────────────────
     print("\n[5/5] Starting GRPO training...")
     trainer_kwargs: Dict[str, Any] = {
@@ -1501,7 +1542,74 @@ def train(
                 f"missing methods: {missing}"
             )
         trainer.add_callback(live_cb)
-    
+
+        class GrpoCheckpointArtifactsCallback(TrainerCallback):
+            """Snapshot plots/tables/JSON on each HF checkpoint save; optional heavy mid-eval on GRPO."""
+
+            def __init__(self) -> None:
+                self.trainer: Any = None
+                self.mid_eval_every = mid_eval_every_eff
+                self.mid_eval_episodes = mid_eval_eps_final
+
+            def on_save(self, args, state, control, **kwargs):
+                step = int(getattr(state, "global_step", 0) or 0)
+                _dump_grpo_checkpoint_bundle(
+                    Path(output_dir),
+                    step,
+                    reward_log,
+                    parse_log,
+                    difficulty_log,
+                    batch_diagnostics,
+                    parse_debug_samples,
+                    torch,
+                )
+                print(
+                    f"[CHECKPOINT_ARTIFACTS] step={step} -> "
+                    f"{output_dir}/checkpoint_artifacts/step_{step:06d}/"
+                )
+
+            def on_step_end(self, args, state, control, **kwargs):
+                if self.mid_eval_every <= 0 or not run_eval or self.mid_eval_episodes <= 0:
+                    return
+                step = int(getattr(state, "global_step", 0) or 0)
+                if step < 1 or step % self.mid_eval_every != 0:
+                    return
+                tr = self.trainer
+                if tr is None:
+                    return
+                m = tr.model
+                was_training = m.training
+                m.eval()
+                try:
+                    with torch.inference_mode():
+                        unwrapped = tr.accelerator.unwrap_model(m)
+                        metrics = _run_model_episodes(
+                            unwrapped,
+                            tokenizer,
+                            n_episodes=int(self.mid_eval_episodes),
+                            tag=f"MID_EVAL_step_{step}",
+                            eval_task_ids=eval_task_ids,
+                        )
+                    out_p = Path(output_dir) / "checkpoint_artifacts" / f"mid_eval_step_{step:06d}.json"
+                    _save_json(metrics, out_p)
+                    vram_p = Path(output_dir) / "checkpoint_artifacts" / "vram_log.jsonl"
+                    vram_p.parent.mkdir(parents=True, exist_ok=True)
+                    with vram_p.open("a", encoding="utf-8") as vf:
+                        vf.write(json.dumps({"step": step, **_vram_snapshot(torch)}) + "\n")
+                    print(
+                        f"[MID_EVAL] step={step} n={self.mid_eval_episodes} "
+                        f"mean_composite={metrics.get('mean_composite')}"
+                    )
+                except Exception as exc:
+                    print(f"[WARN] mid_eval step={step}: {exc}")
+                finally:
+                    if was_training:
+                        m.train()
+
+        _art_cb = GrpoCheckpointArtifactsCallback()
+        trainer.add_callback(_art_cb)
+        _art_cb.trainer = trainer
+
     # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
     _maybe_patch_trainer_sampler(trainer)
     _maybe_force_sequential_train_sampler(trainer, strict_roster=strict_roster)
@@ -1821,6 +1929,131 @@ def _save_json(data: Any, path: Path) -> None:
         json.dump(data, f, indent=2)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _vram_snapshot(torch_mod: Any) -> Dict[str, Any]:
+    snap: Dict[str, Any] = {"cuda_available": bool(torch_mod.cuda.is_available())}
+    if not snap["cuda_available"]:
+        return snap
+    try:
+        free_b, total_b = torch_mod.cuda.mem_get_info()
+        snap["free_bytes"] = int(free_b)
+        snap["total_bytes"] = int(total_b)
+        snap["free_gib"] = round(free_b / (1024**3), 3)
+        snap["total_gib"] = round(total_b / (1024**3), 3)
+    except Exception as exc:
+        snap["error"] = str(exc)
+    return snap
+
+
+def _list_std(vals: List[float]) -> float:
+    if len(vals) < 2:
+        return 0.0
+    m = sum(vals) / len(vals)
+    return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+
+def _dump_grpo_checkpoint_bundle(
+    out_root: Path,
+    step: int,
+    reward_log: Dict[str, List[float]],
+    parse_log: Dict[str, List[int]],
+    difficulty_log: List[float],
+    batch_diagnostics: List[Dict[str, Any]],
+    parse_debug_samples: List[Dict[str, Any]],
+    torch_mod: Any,
+) -> None:
+    """JSON + curve plot + summary table under checkpoint_artifacts/ (GRPO step 2 only)."""
+    art = out_root / "checkpoint_artifacts" / f"step_{step:06d}"
+    art.mkdir(parents=True, exist_ok=True)
+    window = 256
+    tail_stats: Dict[str, Any] = {"reward_mean_std": {}, "parse_rate_tail": {}}
+    for role, xs in reward_log.items():
+        if not xs:
+            continue
+        t = xs[-min(window, len(xs)) :]
+        tail_stats["reward_mean_std"][role] = {
+            "mean": round(sum(t) / len(t), 4),
+            "std": round(_list_std(t), 4),
+            "n": len(t),
+        }
+    for role, xs in parse_log.items():
+        if not xs:
+            continue
+        t = xs[-min(window, len(xs)) :]
+        tail_stats["parse_rate_tail"][role] = round(sum(t) / len(t), 4)
+
+    summary = {
+        "global_step": step,
+        "vram": _vram_snapshot(torch_mod),
+        "tail_stats": tail_stats,
+        "n_batch_diagnostics": len(batch_diagnostics),
+    }
+    _save_json(summary, art / "metrics_summary.json")
+
+    curves = {k: list(v) for k, v in reward_log.items()}
+    _save_json(curves, art / "reward_curves_snapshot.json")
+    _save_json({k: list(v) for k, v in parse_log.items()}, art / "parse_log_snapshot.json")
+    _save_json(list(difficulty_log), art / "difficulty_log_snapshot.json")
+    _save_json(batch_diagnostics[-500:], art / "batch_diagnostics_tail.json")
+    _save_json(parse_debug_samples[-120:], art / "parse_debug_samples_tail.json")
+
+    idx_path = out_root / "checkpoint_artifacts" / "index.jsonl"
+    idx_path.parent.mkdir(parents=True, exist_ok=True)
+    with idx_path.open("a", encoding="utf-8") as lf:
+        lf.write(json.dumps({"step": step, "artifact_dir": art.name, **summary["vram"]}) + "\n")
+
+    try:
+        from training.plot_rewards import plot_training_curves
+
+        plot_training_curves(curves, save_dir=str(art), show=False)
+    except Exception as exc:
+        print(f"[WARN] checkpoint training_curves plot: {exc}")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        roles = ["AMAN", "DMAN", "GENERATOR", "SUPERVISOR", "ADAPT"]
+        rows_tbl: List[List[str]] = []
+        for r in roles:
+            ms = tail_stats["reward_mean_std"].get(r, {})
+            pr = tail_stats["parse_rate_tail"].get(r, "")
+            rows_tbl.append(
+                [
+                    r,
+                    f"{ms.get('mean', '')}" if ms else "",
+                    f"{ms.get('std', '')}" if ms else "",
+                    f"{pr}" if pr != "" else "",
+                ]
+            )
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.axis("off")
+        tbl = ax.table(
+            cellText=rows_tbl,
+            colLabels=["role", "reward_mean_tail", "reward_std_tail", "parse_rate_tail"],
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.scale(1.2, 1.8)
+        ax.set_title(f"GRPO checkpoint summary (step {step})", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(art / "metrics_table.png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+    except Exception as exc:
+        print(f"[WARN] checkpoint metrics_table.png: {exc}")
+
+
 def _check_reward_hacking(reward_log: Dict[str, List[float]]) -> None:
     """Warn when mean composite rises but role rewards collapse (gaming signal)."""
     comp = reward_log["composite"]
@@ -2017,6 +2250,20 @@ def main() -> None:
         default=None,
         help="Cap GRPO optimizer steps (dev/smoke). Default: derived from --episodes and batch layout.",
     )
+    parser.add_argument(
+        "--mid_eval_every",
+        type=int,
+        default=0,
+        help="GRPO only: run full _run_model_episodes mid-train every N global steps (min 50; "
+        "also set ATC_MID_EVAL_EVERY). Uses ≥50 episodes unless --mid_eval_episodes set.",
+    )
+    parser.add_argument(
+        "--mid_eval_episodes",
+        type=int,
+        default=0,
+        help="GRPO only: mid-eval episode count (default 0 = max(50, --eval_episodes)). "
+        "Values <50 are raised to 50.",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -2044,6 +2291,10 @@ def main() -> None:
     else:
         if args.static_grounded_dataset:
             os.environ["ATC_STATIC_GROUNDED_DATASET"] = "1"
+        me_every = int(args.mid_eval_every)
+        if me_every == 0:
+            me_every = _env_int("ATC_MID_EVAL_EVERY", 0)
+        me_eps = int(args.mid_eval_episodes) if args.mid_eval_episodes else None
         train(
             model_name=args.model,
             output_dir=args.output_dir,
@@ -2058,6 +2309,8 @@ def main() -> None:
             curriculum_state_path=args.curriculum_state,
             adapter_in=args.adapter_in,
             max_steps=args.max_steps,
+            mid_eval_every=me_every,
+            mid_eval_episodes=me_eps,
         )
 
 

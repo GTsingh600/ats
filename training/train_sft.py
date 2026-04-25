@@ -30,6 +30,7 @@ os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 def main() -> None:
     import inspect
+    import random
     import time
     import torch
 
@@ -55,6 +56,24 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument(
+        "--eval_split",
+        type=float,
+        default=0.05,
+        help="Fraction of rows for validation (early stopping). 0 disables val / early stop.",
+    )
+    p.add_argument(
+        "--eval_steps",
+        type=int,
+        default=50,
+        help="Run validation every N steps (when eval_split > 0).",
+    )
+    p.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=4,
+        help="Stop if eval_loss does not improve for this many checks; 0 disables early stopping.",
+    )
+    p.add_argument(
         "--continuous_curriculum_path",
         default=None,
         help="Optional path to continuous_curriculum_state.json (same as GRPO static build).",
@@ -73,6 +92,7 @@ def main() -> None:
 
     try:
         from datasets import Dataset
+        from transformers import EarlyStoppingCallback
         from trl import SFTConfig, SFTTrainer
     except Exception as exc:
         print(f"[ERROR] datasets/trl import failed: {exc}")
@@ -107,7 +127,20 @@ def main() -> None:
         model.generation_config.max_length = None
 
     text_rows = materialize_text_rows(rows, tokenizer)
-    dataset = Dataset.from_list(text_rows)
+    eval_split = float(args.eval_split)
+    train_rows = text_rows
+    eval_ds = None
+    if eval_split > 0.0 and len(text_rows) >= 3:
+        rng = random.Random(int(args.seed))
+        idx = list(range(len(text_rows)))
+        rng.shuffle(idx)
+        n_val = max(1, int(round(len(text_rows) * eval_split)))
+        n_val = min(n_val, len(text_rows) - 1)
+        train_rows = [text_rows[i] for i in idx[n_val:]]
+        val_rows = [text_rows[i] for i in idx[:n_val]]
+        eval_ds = Dataset.from_list(val_rows)
+        print(f"[SFT] train/eval split: {len(train_rows)} train, {len(val_rows)} eval ({eval_split:.0%})")
+    dataset = Dataset.from_list(train_rows)
 
     model = FastLanguageModel.get_peft_model(
         model,
@@ -139,6 +172,14 @@ def main() -> None:
         "save_steps": max(1, min(max(50, int(args.max_steps) // 4), int(args.max_steps))),
         "save_total_limit": 2,
     }
+    if eval_ds is not None:
+        max_s = int(args.max_steps)
+        ev_st = max(10, min(int(args.eval_steps), max_s))
+        sft_kw["eval_strategy"] = "steps"
+        sft_kw["eval_steps"] = ev_st
+        sft_kw["load_best_model_at_end"] = True
+        sft_kw["metric_for_best_model"] = "eval_loss"
+        sft_kw["greater_is_better"] = False
     sig = inspect.signature(SFTConfig.__init__).parameters
     sft_kw = {k: v for k, v in sft_kw.items() if k in sig}
 
@@ -147,6 +188,19 @@ def main() -> None:
         "train_dataset": dataset,
         "args": SFTConfig(**sft_kw),
     }
+    if eval_ds is not None:
+        trainer_kw["eval_dataset"] = eval_ds
+    callbacks = []
+    if eval_ds is not None and int(args.early_stop_patience) > 0:
+        callbacks.append(
+            EarlyStoppingCallback(early_stopping_patience=int(args.early_stop_patience))
+        )
+        print(
+            f"[SFT] early stopping: patience={int(args.early_stop_patience)} on eval_loss "
+            f"(eval every {sft_kw.get('eval_steps')} steps)"
+        )
+    if callbacks:
+        trainer_kw["callbacks"] = callbacks
     tr_sig = inspect.signature(SFTTrainer.__init__).parameters
     if "processing_class" in tr_sig:
         trainer_kw["processing_class"] = tokenizer
