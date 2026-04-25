@@ -46,11 +46,18 @@ def plot_training_curves(
         print("[ERROR] pip install matplotlib")
         sys.exit(1)
 
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.grid": True, "grid.alpha": 0.3, "grid.linestyle": "--",
+        "figure.dpi": 150,
+    })
+
     roles   = ["AMAN", "DMAN", "GENERATOR", "SUPERVISOR"]
-    colours = {"AMAN": "#2196F3", "DMAN": "#FF9800", "GENERATOR": "#F44336", "SUPERVISOR": "#4CAF50"}
+    colours = {"AMAN": "#1976D2", "DMAN": "#F57C00", "GENERATOR": "#C62828", "SUPERVISOR": "#2E7D32"}
 
     fig = plt.figure(figsize=(16, 10))
-    fig.suptitle("Multi-Agent ATC — GRPO Training Curves", fontsize=14, fontweight="bold")
+    fig.suptitle("Multi-Agent ATC — GRPO Training Curves", fontsize=15, fontweight="bold", y=0.98)
     gs  = gridspec.GridSpec(2, 2, hspace=0.4, wspace=0.35)
 
     # ── Plot 1: Per-role rewards ──────────────────────────────────────────────
@@ -154,41 +161,65 @@ def plot_eval_comparison(eval_results: Dict, save_dir: Optional[str] = None, sho
         print("[WARN] eval_results must have 'base' and 'trained' keys")
         return
 
+    # Support both short keys (smoke-test synthetic) and long keys (train_grpo.py output)
+    def _get(d: dict, *keys: str) -> float:
+        for k in keys:
+            if k in d:
+                return d[k]
+        return 0.0
+
     metrics = [
-        ("Composite Score",    "mean_composite"),
-        ("AMAN Reward",        "mean_aman"),
-        ("DMAN Reward",        "mean_dman"),
-        ("Coordination Score", "mean_coord"),
-        ("Success Rate",       "success_rate"),
+        ("Composite Score",    "mean_composite",    "mean_composite"),
+        ("AMAN Reward",        "mean_aman",         "mean_aman_reward"),
+        ("DMAN Reward",        "mean_dman",         "mean_dman_reward"),
+        ("Coordination Score", "mean_coord",        "mean_coordination"),
+        ("Success Rate",       "success_rate",      "success_rate"),
     ]
 
     labels  = [m[0] for m in metrics]
-    base_v  = [base.get(m[1],    0.0) for m in metrics]
-    train_v = [trained.get(m[1], 0.0) for m in metrics]
+    base_v  = [_get(base,    m[1], m[2]) for m in metrics]
+    train_v = [_get(trained, m[1], m[2]) for m in metrics]
 
-    x   = range(len(labels))
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "figure.dpi": 150,
+    })
+
+    x   = list(range(len(labels)))
     w   = 0.35
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    bars1 = ax.bar([i - w/2 for i in x], base_v,  w, label="Base (untrained)", color="#90A4AE", alpha=0.85)
-    bars2 = ax.bar([i + w/2 for i in x], train_v, w, label="Trained (GRPO)",   color="#1565C0", alpha=0.85)
+    ax.bar([i - w/2 for i in x], base_v,  w, label="Base (untrained)", color="#90A4AE", alpha=0.85)
+    bars2 = ax.bar([i + w/2 for i in x], train_v, w, label="Trained (GRPO)", color="#1565C0", alpha=0.90)
 
-    for bar in bars2:
+    for i, (bar, bv, tv) in enumerate(zip(bars2, base_v, train_v)):
         ax.annotate(
-            f"{bar.get_height():.3f}",
-            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            f"{tv:.2f}",
+            xy=(bar.get_x() + bar.get_width() / 2, tv),
             xytext=(0, 3), textcoords="offset points",
-            ha="center", va="bottom", fontsize=8, color="#1565C0",
+            ha="center", va="bottom", fontsize=8, fontweight="bold", color="#1565C0",
         )
+        if bv > 0:
+            pct = (tv - bv) / bv * 100
+            ax.annotate(
+                f"+{pct:.0f}%" if pct >= 0 else f"{pct:.0f}%",
+                xy=(i, max(tv, bv) + 0.08),
+                ha="center", va="bottom", fontsize=7.5,
+                color="#2E7D32" if pct >= 0 else "#C62828",
+                fontweight="bold",
+            )
 
-    ax.set_xticks(list(x))
+    ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
     ax.set_ylabel("Score (0–1)")
-    ax.set_ylim(0, 1.15)
-    ax.set_title("Multi-Agent ATC: Before vs After GRPO Training", fontsize=13, fontweight="bold")
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    ax.axhline(0.6, color="orange", linestyle="--", linewidth=1, label="Success threshold (0.60)")
+    ax.set_ylim(0, 1.25)
+    ax.set_title("Multi-Agent ATC: Before vs After GRPO Training",
+                 fontsize=13, fontweight="bold", pad=12)
+    ax.legend(loc="upper left")
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.axhline(0.6, color="#FF8F00", linestyle="--", linewidth=1.2,
+               label="Success threshold (0.60)", zorder=0)
 
     plt.tight_layout()
     if save_dir:
