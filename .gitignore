@@ -44,3 +44,6 @@ outputs/
 
 # Misc local scratch files
 comman.txt
+
+# Vendored upstream mirrors (regenerate: bash scripts/fetch_openenv_hackathon_refs.sh)
+reference/openenv_hackathon/

@@ -41,12 +41,16 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# OpenEnv hackathon winners / strong baselines — same defaults as sid-rp/kube-sre-gym train.py:
+#   https://raw.githubusercontent.com/sid-rp/kube-sre-gym/main/train.py
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 def _require_training_deps():
     if sys.version_info >= (3, 14):
@@ -618,6 +622,13 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     return rewards
 
 
+def _hf_live_grounded_generator(manager: Any, sd: int) -> Iterator[Dict[str, Any]]:
+    """Top-level generator for ``datasets.IterableDataset.from_generator`` (TRL/Accelerate batching)."""
+    from training.live_curriculum import iter_live_grounded_rows
+
+    yield from iter_live_grounded_rows(manager, int(sd))
+
+
 # ── Training entry point ──────────────────────────────────────────────────────
 
 def train(
@@ -632,6 +643,7 @@ def train(
     eval_episodes: int = 3,
     use_grounded_curriculum: bool = False,
     curriculum_state_path: Optional[str] = None,
+    adapter_in: Optional[str] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -706,18 +718,29 @@ def train(
     # Prevent generate() ambiguity warnings from inherited max_length defaults.
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.max_length = None
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_rank,
-        lora_alpha=LORA_ALPHA,
-        target_modules=LORA_TARGETS,
-        lora_dropout=0.0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=seed,
-    )
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"    LoRA rank={lora_rank}, trainable params: {trainable:,}")
+    _adapter_path = Path(adapter_in) if adapter_in else None
+    if _adapter_path and (_adapter_path / "adapter_config.json").is_file():
+        from peft import PeftModel
+
+        print(f"    Loading existing LoRA (SFT or prior GRPO): {_adapter_path}")
+        model = PeftModel.from_pretrained(model, str(_adapter_path), is_trainable=True)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"    Continued adapter trainable params: {trainable:,}")
+    else:
+        if adapter_in:
+            print(f"[WARN] --adapter_in {adapter_in!r} missing adapter_config.json; training fresh LoRA.")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_rank,
+            lora_alpha=LORA_ALPHA,
+            target_modules=LORA_TARGETS,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=seed,
+        )
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"    LoRA rank={lora_rank}, trainable params: {trainable:,}")
 
     # ── 2b. Base model eval (before any gradient steps) ──────────────────────
     base_model_metrics: Optional[Dict[str, Any]] = None
@@ -766,19 +789,21 @@ def train(
             output_dir=Path(output_dir),
             continuous_state_path=continuous_path,
         )
-        from torch.utils.data import IterableDataset
-        from training.live_curriculum import iter_live_grounded_rows
-
-        class _LiveTorchIterable(IterableDataset):  # type: ignore[misc]
-            def __init__(self, mgr, sd: int):
-                super().__init__()
-                self._mgr = mgr
-                self._sd = int(sd)
-
-            def __iter__(self):
-                return iter_live_grounded_rows(self._mgr, self._sd)
-
-        dataset = _LiveTorchIterable(curriculum_manager, seed)
+        # PyTorch IterableDataset + default_collate yields nested dict batches that include
+        # raw str fields; Accelerate's find_batch_size then crashes. HF IterableDataset matches
+        # Dataset.from_list and integrates with TRL GRPO.
+        _hf_cache = Path(output_dir) / ".hf_datasets_cache"
+        _hf_cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_DATASETS_CACHE", str(_hf_cache.resolve()))
+        try:
+            from datasets import IterableDataset as HFIterableDataset
+        except ImportError:
+            print("[ERROR] pip install datasets (required for live grounded GRPO)")
+            sys.exit(1)
+        dataset = HFIterableDataset.from_generator(
+            _hf_live_grounded_generator,
+            gen_kwargs={"manager": curriculum_manager, "sd": int(seed)},
+        )
         dataset_train: List[Dict[str, Any]] = []
         dataset_val: List[Dict[str, Any]] = []
         print(
@@ -897,6 +922,9 @@ def train(
     }
     if curriculum_manager is not None:
         grpo_kwargs["max_steps"] = int(computed_max_steps)
+        # Live manager is not picklable; keep all iteration in the main process.
+        if _config_supports("dataloader_num_workers", GRPOConfig):
+            grpo_kwargs["dataloader_num_workers"] = 0
     else:
         grpo_kwargs["num_train_epochs"] = 1
 
@@ -1189,6 +1217,8 @@ def train(
         trainer_kwargs["config"] = grpo_config
 
     trainer = GRPOTrainer(**trainer_kwargs)
+    if curriculum_manager is not None and hasattr(trainer.args, "dataloader_num_workers"):
+        trainer.args.dataloader_num_workers = 0
 
     class LiveMetricsCallback(TrainerCallback):
         """Stream concise live metrics into notebook/stdout while training."""
@@ -1787,6 +1817,11 @@ def main() -> None:
         action="store_true",
         help="With --grounded_curriculum, use a fixed pre-built dataset (disables live iterable resampling).",
     )
+    parser.add_argument(
+        "--adapter_in",
+        default=None,
+        help="Directory with a prior LoRA adapter (e.g. outputs/atc-sft-json from train_sft.py).",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -1826,6 +1861,7 @@ def main() -> None:
             eval_episodes=max(1, int(args.eval_episodes)),
             use_grounded_curriculum=bool(args.grounded_curriculum),
             curriculum_state_path=args.curriculum_state,
+            adapter_in=args.adapter_in,
         )
 
 
