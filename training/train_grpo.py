@@ -123,8 +123,8 @@ GRAD_ACCUM     = 2           # effective batch = 8
 LR             = 5e-5
 # In trl==0.16.0 + unsloth==2026.4.7 with PEFT, non-zero KL can fail when
 # ref_per_token_logps is absent in the fast path (ref=None crash).
-KL_COEFF       = 0.02
-WARMUP_RATIO   = 0.0
+KL_COEFF       = 0.0
+WARMUP_STEPS_FRACTION = 0.03
 LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
@@ -143,14 +143,27 @@ def _configure_runtime_warnings() -> None:
     )
     warnings.filterwarnings(
         "ignore",
+        message=r".*generation_config.*generation-related arguments.*deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
         message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*deprecated.*",
         category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`use_return_dict` is deprecated! Use `return_dict` instead!",
     )
     # Some transformers builds emit this through logging, not warnings.
     class _SuppressMaxLenWarning(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
-            return "Both `max_new_tokens`" not in msg
+            suppressed = (
+                "Both `max_new_tokens`" in msg
+                or "generation_config" in msg and "generation-related arguments" in msg
+                or "`use_return_dict` is deprecated" in msg
+            )
+            return not suppressed
 
     for name in (
         "transformers.generation.utils",
@@ -466,8 +479,18 @@ def _effective_kl_coeff() -> float:
         print(f"[WARN] Negative KL coeff {value} is invalid; clamping to 0.0.")
         value = 0.0
 
-    if value > 0.0:
-        print(f"[INFO] KL penalty enabled: {value:.4f}")
+    if value <= 0.0:
+        return 0.0
+
+    # Unsloth+TRL fast path can crash with KL enabled unless explicitly forced.
+    force_kl = os.getenv("ATC_FORCE_KL", "").strip().lower() in {"1", "true", "yes"}
+    if not force_kl:
+        print(
+            "[WARN] KL>0 requested but disabled for this Unsloth/TRL stack to avoid "
+            "ref_per_token_logps=None crashes. Set ATC_FORCE_KL=1 to override."
+        )
+        return 0.0
+    print(f"[INFO] KL penalty enabled (forced): {value:.4f}")
     return value
 
 
@@ -718,8 +741,11 @@ def train(
 
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
+    est_steps = max(1, len(dataset_train) // max(1, batch_size))
+    warmup_steps = max(1, int(round(est_steps * WARMUP_STEPS_FRACTION)))
     print(
-        f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, kl={kl_coeff})..."
+        f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, kl={kl_coeff}, "
+        f"warmup_steps={warmup_steps})..."
     )
     grpo_kwargs: Dict[str, Any] = {
         "num_generations":              num_generations,
@@ -728,7 +754,6 @@ def train(
         "per_device_train_batch_size":  batch_size,
         "gradient_accumulation_steps":  grad_accum,
         "num_train_epochs":             1,
-        "warmup_ratio":                 WARMUP_RATIO,
         "lr_scheduler_type":            "cosine",
         "logging_steps":                LOGGING_STEPS,
         "save_steps":                   SAVE_STEPS,
@@ -747,15 +772,22 @@ def train(
         grpo_kwargs["report_to"] = "none"
 
     # Compatibility shims for different TRL versions
+    if _config_supports("warmup_steps", GRPOConfig):
+        grpo_kwargs["warmup_steps"] = warmup_steps
+    elif _config_supports("warmup_ratio", GRPOConfig):
+        # Backward-compatible fallback only when warmup_steps is unavailable.
+        grpo_kwargs["warmup_ratio"] = WARMUP_STEPS_FRACTION
+
     if _config_supports("max_completion_length", GRPOConfig):
         grpo_kwargs["max_completion_length"] = max_new_tokens
     elif _config_supports("max_new_tokens", GRPOConfig):
         grpo_kwargs["max_new_tokens"] = max_new_tokens
 
-    if _config_supports("beta", GRPOConfig):
-        grpo_kwargs["beta"] = kl_coeff
-    elif _config_supports("kl_coeff", GRPOConfig):
-        grpo_kwargs["kl_coeff"] = kl_coeff
+    if kl_coeff > 0.0:
+        if _config_supports("beta", GRPOConfig):
+            grpo_kwargs["beta"] = kl_coeff
+        elif _config_supports("kl_coeff", GRPOConfig):
+            grpo_kwargs["kl_coeff"] = kl_coeff
 
     if _config_supports("use_vllm", GRPOConfig):
         grpo_kwargs["use_vllm"] = False
