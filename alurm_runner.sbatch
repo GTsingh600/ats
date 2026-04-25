@@ -172,8 +172,47 @@ PY
             --episodes 2 \
             --n_generations 4 \
             --seed 42
-        
+
         echo '===== TRAINING COMPLETE ====='
+
+        # ===== PLOT GENERATION =====
+        echo '===== GENERATING PLOTS ====='
+        PLOTS_DIR=/hostd/atc/outputs/plots
+        OUT_DIR=/hostd/atc/outputs/atc-multiagent
+        mkdir -p \"\${PLOTS_DIR}\"
+
+        # 1. Per-role reward curves
+        CURVES=\${OUT_DIR}/reward_curves.json
+        if [ -f \"\${CURVES}\" ]; then
+            python training/plot_rewards.py \
+                --input \"\${CURVES}\" \
+                --save \"\${PLOTS_DIR}\" \
+                --no_show
+            echo \"  training_curves.png → \${PLOTS_DIR}\"
+        else
+            echo '  [WARN] reward_curves.json not found, skipping training_curves plot'
+        fi
+
+        # 2. Before/after comparison (base_model_metrics + trained_model_metrics)
+        BASE_M=\${OUT_DIR}/base_model_metrics.json
+        TRAINED_M=\${OUT_DIR}/trained_model_metrics.json
+        if [ -f \"\${BASE_M}\" ] && [ -f \"\${TRAINED_M}\" ]; then
+            python - <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/hostd/atc/repo")
+base    = json.loads(Path("/hostd/atc/outputs/atc-multiagent/base_model_metrics.json").read_text())
+trained = json.loads(Path("/hostd/atc/outputs/atc-multiagent/trained_model_metrics.json").read_text())
+from training.plot_rewards import plot_eval_comparison
+plot_eval_comparison({"base": base, "trained": trained},
+                     save_dir="/hostd/atc/outputs/plots", show=False)
+print("  eval_comparison.png → /hostd/atc/outputs/plots")
+PY
+        else
+            echo '  [WARN] base/trained metrics not found, skipping eval_comparison plot'
+        fi
+
+        echo \"===== PLOTS SAVED TO \${PLOTS_DIR} =====\"
      "
 
 echo "End time: $(date)"
