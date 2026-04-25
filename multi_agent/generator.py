@@ -21,7 +21,6 @@ Mutation catalogue:
 
 from __future__ import annotations
 
-import copy
 import random
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
@@ -52,8 +51,6 @@ except ImportError:
     from multi_agent.models import GeneratorAction, GeneratorMutation, MutationType
 
 
-ESCALATION_THRESHOLD = 0.65   # escalate when agents consistently above this
-FLOOR_THRESHOLD      = 0.30   # ease back when agents consistently below this
 EMA_ALPHA            = 0.2    # exponential moving average smoothing factor
 MAX_MUTATIONS_PER_EPISODE = 3 # cap mutations to keep scenarios solvable
 MIN_WINDOW_WIDTH     = 8      # never squeeze window below 8 minutes
@@ -72,6 +69,13 @@ _PRIORITY_ALIASES: Dict[str, str] = {
 MASTERY_WINDOW       = 10     # rolling window for per-scenario success rate
 MASTERY_THRESHOLD    = 0.55   # rate below this → mutation considered "weak"/underused
 
+# Continuous curriculum controller (difficulty d in [0, 1]).
+DIFFICULTY_MIN = 0.05
+DIFFICULTY_MAX = 0.95
+TARGET_SUCCESS = 0.62
+CURRICULUM_GAIN = 0.12
+DIFFICULTY_CONCENTRATION = 14.0
+
 
 class ChallengeGenerator:
     """Adversarial curriculum generator for multi-agent ATC training.
@@ -83,9 +87,15 @@ class ChallengeGenerator:
     def __init__(self, seed: int = 0) -> None:
         self._rng = random.Random(seed)
         self._ema_score: float = 0.5       # start at mid-difficulty assumption
-        self._difficulty_level: int = 1    # 1=easy mutations → 6=max chaos
+        self._difficulty_mu: float = 0.08
+        self._difficulty_concentration: float = DIFFICULTY_CONCENTRATION
+        self._last_sampled_difficulty: float = self._difficulty_mu
+        # Backward-compat shim for old tests/config using integer levels.
+        self._difficulty_level: int = int(round(1 + 5 * self._last_sampled_difficulty))
         self._score_history: Deque[float] = deque(maxlen=10)
         self._mutation_history: List[Dict] = []
+        self._difficulty_history: Deque[float] = deque(maxlen=200)
+        self._last_mutation_types: List[str] = []
         # Per-scenario mastery: track agent success rate per task_id and mutation_type
         self._task_mastery: Dict[str, Deque[float]] = {}
         self._mutation_mastery: Dict[str, Deque[float]] = {}
@@ -96,14 +106,24 @@ class ChallengeGenerator:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def update(self, controller_score: float) -> None:
-        """Update EMA and adjust difficulty level after each episode."""
-        self._score_history.append(controller_score)
-        self._ema_score = EMA_ALPHA * controller_score + (1 - EMA_ALPHA) * self._ema_score
+        """Update EMA and curriculum mean from real controller performance."""
+        manual_level = getattr(self, "_difficulty_level", None)
+        if (not self._score_history) and isinstance(manual_level, int) and 1 <= manual_level <= 6:
+            self._difficulty_mu = max(
+                DIFFICULTY_MIN,
+                min(DIFFICULTY_MAX, (manual_level - 1) / 5.0),
+            )
+        score = max(0.0, min(1.0, float(controller_score)))
+        self._score_history.append(score)
+        self._ema_score = EMA_ALPHA * score + (1 - EMA_ALPHA) * self._ema_score
 
-        if self._ema_score > ESCALATION_THRESHOLD and self._difficulty_level < 6:
-            self._difficulty_level += 1
-        elif self._ema_score < FLOOR_THRESHOLD and self._difficulty_level > 1:
-            self._difficulty_level -= 1
+        # Raise difficulty when controllers are outperforming target success rate.
+        delta = CURRICULUM_GAIN * (score - TARGET_SUCCESS)
+        self._difficulty_mu = max(
+            DIFFICULTY_MIN,
+            min(DIFFICULTY_MAX, self._difficulty_mu + delta),
+        )
+        self._difficulty_level = int(round(1 + 5 * self._difficulty_mu))
 
     def record(
         self,
@@ -153,7 +173,10 @@ class ChallengeGenerator:
             "task_mastery": task_means,
             "mutation_mastery": mut_means,
             "weak_mutations": self.get_weak_mutations(),
-            "difficulty_level": self._difficulty_level,
+            "difficulty_level": self.difficulty_level,
+            "difficulty_mu": round(self._difficulty_mu, 4),
+            "difficulty_last": round(self._last_sampled_difficulty, 4),
+            "difficulty_mean": self.difficulty_mean,
             "ema_score": self.ema_score,
         }
 
@@ -171,16 +194,30 @@ class ChallengeGenerator:
         """
         task = self._deep_copy_task(base_task)
 
+        manual_level = getattr(self, "_difficulty_level", None)
+        if isinstance(manual_level, int) and 1 <= manual_level <= 6:
+            self._difficulty_mu = max(
+                DIFFICULTY_MIN,
+                min(DIFFICULTY_MAX, (manual_level - 1) / 5.0),
+            )
+
+        sampled_difficulty = self._sample_difficulty()
+        self._last_sampled_difficulty = sampled_difficulty
+        self._difficulty_level = int(round(1 + 5 * sampled_difficulty))
+        self._difficulty_history.append(sampled_difficulty)
+
         if generator_action and generator_action.mutations:
             mutations = generator_action.mutations[:MAX_MUTATIONS_PER_EPISODE]
         else:
-            mutations = self._sample_mutations(task)
+            mutations = self._sample_mutations(task, sampled_difficulty)
 
+        self._last_mutation_types = [m.mutation_type.value for m in mutations]
         for mut in mutations:
             task = self._apply_mutation(task, mut)
             self._mutation_history.append({
                 "type": mut.mutation_type.value,
-                "level": self._difficulty_level,
+                "difficulty": round(sampled_difficulty, 4),
+                "level": self.difficulty_level,
                 "ema": round(self._ema_score, 3),
             })
 
@@ -218,39 +255,59 @@ class ChallengeGenerator:
 
     @property
     def difficulty_level(self) -> int:
-        return self._difficulty_level
+        # Labels are for logging only; generation uses continuous difficulty.
+        manual = getattr(self, "_difficulty_level", None)
+        if isinstance(manual, int) and 1 <= manual <= 6:
+            return manual
+        return int(round(1 + 5 * self._last_sampled_difficulty))
 
     @property
     def ema_score(self) -> float:
         return round(self._ema_score, 3)
 
+    @property
+    def difficulty_scalar(self) -> float:
+        return round(self._last_sampled_difficulty, 4)
+
+    @property
+    def difficulty_mean(self) -> float:
+        if not self._difficulty_history:
+            return round(self._difficulty_mu, 4)
+        return round(sum(self._difficulty_history) / len(self._difficulty_history), 4)
+
+    @property
+    def difficulty_distribution(self) -> Dict[str, float]:
+        alpha = max(0.2, self._difficulty_mu * self._difficulty_concentration)
+        beta = max(0.2, (1.0 - self._difficulty_mu) * self._difficulty_concentration)
+        return {"alpha": round(alpha, 4), "beta": round(beta, 4)}
+
+    @property
+    def last_mutation_types(self) -> List[str]:
+        return list(self._last_mutation_types)
+
     # ── Mutation sampling ─────────────────────────────────────────────────────
 
-    def _sample_mutations(self, task: TaskDefinition) -> List[GeneratorMutation]:
-        """Rule-based mutation selection based on current difficulty level.
+    def _sample_mutations(self, task: TaskDefinition, difficulty: float) -> List[GeneratorMutation]:
+        """Rule-based mutation selection based on continuous difficulty.
 
         Mutations whose type appears in get_weak_mutations() are boosted 3x in
         the sampling pool, steering the curriculum toward underexplored challenges.
         """
         mutations: List[GeneratorMutation] = []
-
-        level = self._difficulty_level
-        n_mutations = min(MAX_MUTATIONS_PER_EPISODE, max(1, level // 2))
+        difficulty = max(0.0, min(1.0, difficulty))
+        n_mutations = min(
+            MAX_MUTATIONS_PER_EPISODE,
+            max(1, int(round(1.0 + 2.0 * difficulty))),
+        )
 
         # Mutation pool weighted by difficulty
         pool: List[MutationType] = []
-        if level >= 1:
-            pool += [MutationType.TIGHTEN_WINDOW] * 3
-        if level >= 2:
-            pool += [MutationType.ADD_ATFM_DEADLINE] * 2
-        if level >= 3:
-            pool += [MutationType.INCREASE_WEATHER_PENALTY] * 2
-        if level >= 4:
-            pool += [MutationType.INJECT_EMERGENCY] * 2
-        if level >= 5:
-            pool += [MutationType.ADD_CONFLICTING_FLIGHT] * 2
-        if level >= 6:
-            pool += [MutationType.CLOSE_RUNWAY_WINDOW] * 1
+        pool += [MutationType.TIGHTEN_WINDOW] * max(1, int(round(2 + 4 * difficulty)))
+        pool += [MutationType.ADD_ATFM_DEADLINE] * max(1, int(round(1 + 3 * difficulty)))
+        pool += [MutationType.INCREASE_WEATHER_PENALTY] * max(1, int(round(1 + 2 * difficulty)))
+        pool += [MutationType.INJECT_EMERGENCY] * max(1, int(round(0.5 + 2.5 * difficulty)))
+        pool += [MutationType.ADD_CONFLICTING_FLIGHT] * max(1, int(round(0.5 + 3 * difficulty * difficulty)))
+        pool += [MutationType.CLOSE_RUNWAY_WINDOW] * max(1, int(round(0.3 + 2.2 * difficulty * difficulty)))
 
         # Boost weak mutations: add 2 extra copies (3x total) for each type that
         # the agents haven't mastered yet, so the curriculum focuses there.
@@ -265,7 +322,8 @@ class ChallengeGenerator:
         for mtype in selected:
             if mtype == MutationType.TIGHTEN_WINDOW:
                 target = self._rng.choice(task.flights)
-                squeeze = self._rng.randint(2, 4 + level)
+                squeeze_base = 2.0 + 6.0 * (difficulty ** 1.2)  # timing_overlap signal
+                squeeze = max(2, int(round(squeeze_base + self._rng.uniform(-1.0, 1.0))))
                 mutations.append(GeneratorMutation(
                     mutation_type=mtype,
                     target_flight_id=target.flight_id,
@@ -275,7 +333,9 @@ class ChallengeGenerator:
 
             elif mtype == MutationType.ADD_ATFM_DEADLINE and departures:
                 target = self._rng.choice(departures)
-                buffer = self._rng.randint(5, 10)
+                # Harder (high d) means tighter ATFM buffers.
+                buffer_base = 11.0 - 6.0 * difficulty
+                buffer = max(3, int(round(buffer_base + self._rng.uniform(-1.0, 1.0))))
                 mutations.append(GeneratorMutation(
                     mutation_type=mtype,
                     target_flight_id=target.flight_id,
@@ -285,7 +345,7 @@ class ChallengeGenerator:
 
             elif mtype == MutationType.INCREASE_WEATHER_PENALTY:
                 target_rwy = self._rng.choice(task.runways)
-                delta = round(self._rng.uniform(0.1, 0.3), 2)
+                delta = round(max(0.05, min(0.45, 0.07 + 0.30 * difficulty + self._rng.uniform(-0.03, 0.03))), 2)
                 mutations.append(GeneratorMutation(
                     mutation_type=mtype,
                     target_runway_id=target_rwy.runway_id,
@@ -295,8 +355,10 @@ class ChallengeGenerator:
 
             elif mtype == MutationType.INJECT_EMERGENCY and arrivals:
                 base = self._rng.choice(arrivals)
+                overlap_span = max(1, int(round(20 - 14 * difficulty)))
                 window_center = self._rng.randint(
-                    base.earliest_minute, min(base.latest_minute, base.earliest_minute + 20)
+                    base.earliest_minute,
+                    min(base.latest_minute, base.earliest_minute + overlap_span),
                 )
                 mutations.append(GeneratorMutation(
                     mutation_type=mtype,
@@ -327,7 +389,7 @@ class ChallengeGenerator:
 
             elif mtype == MutationType.CLOSE_RUNWAY_WINDOW:
                 target_rwy = self._rng.choice(task.runways)
-                duration = self._rng.randint(10, 20)
+                duration = max(6, int(round(8 + 16 * difficulty + self._rng.uniform(-2.0, 2.0))))
                 mutations.append(GeneratorMutation(
                     mutation_type=mtype,
                     target_runway_id=target_rwy.runway_id,
@@ -511,3 +573,9 @@ class ChallengeGenerator:
 
     def _deep_copy_task(self, task: TaskDefinition) -> TaskDefinition:
         return TaskDefinition.model_validate(task.model_dump())
+
+    def _sample_difficulty(self) -> float:
+        alpha = max(0.2, self._difficulty_mu * self._difficulty_concentration)
+        beta = max(0.2, (1.0 - self._difficulty_mu) * self._difficulty_concentration)
+        d = self._rng.betavariate(alpha, beta)
+        return max(DIFFICULTY_MIN, min(DIFFICULTY_MAX, d))

@@ -30,10 +30,12 @@ Colab one-liner:
 from __future__ import annotations
 
 import argparse
+import math
 import inspect
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -121,11 +123,12 @@ GRAD_ACCUM     = 2           # effective batch = 8
 LR             = 5e-5
 # In trl==0.16.0 + unsloth==2026.4.7 with PEFT, non-zero KL can fail when
 # ref_per_token_logps is absent in the fast path (ref=None crash).
-KL_COEFF       = 0.0
-WARMUP_RATIO   = 0.05
+KL_COEFF       = 0.02
+WARMUP_RATIO   = 0.0
 LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
+REWARD_CLIP_ABS = 0.95
 
 
 def _configure_runtime_warnings() -> None:
@@ -464,10 +467,7 @@ def _effective_kl_coeff() -> float:
         value = 0.0
 
     if value > 0.0:
-        print(
-            "[WARN] Non-zero KL enabled. On trl==0.16.0 + unsloth==2026.4.7 this may "
-            "trigger ref_per_token_logps=None errors with PEFT."
-        )
+        print(f"[INFO] KL penalty enabled: {value:.4f}")
     return value
 
 
@@ -477,6 +477,46 @@ def _select_sample_value(value: Any, index: int) -> Any:
             return None
         return value[index] if index < len(value) else value[-1]
     return value
+
+
+def _shannon_entropy(items: List[str]) -> float:
+    if not items:
+        return 0.0
+    counts: Dict[str, int] = {}
+    for item in items:
+        counts[item] = counts.get(item, 0) + 1
+    total = float(len(items))
+    h = 0.0
+    for c in counts.values():
+        p = c / total
+        h -= p * math.log(p + 1e-12, 2)
+    return h
+
+
+def _difficulty_reward_profile(difficulties: List[float], rewards: List[float]) -> Dict[str, Any]:
+    pairs = [(d, r) for d, r in zip(difficulties, rewards) if d == d and r == r]
+    if not pairs:
+        return {}
+    bins = [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)]
+    out: Dict[str, Any] = {}
+    for lo, hi in bins:
+        vals = [r for d, r in pairs if lo <= d < hi]
+        key = f"{lo:.2f}-{min(1.0, hi):.2f}"
+        if not vals:
+            out[key] = {"count": 0, "mean_reward": None, "std_reward": None}
+            continue
+        mean_val = sum(vals) / len(vals)
+        std_val = (
+            math.sqrt(sum((v - mean_val) ** 2 for v in vals) / len(vals))
+            if len(vals) > 1
+            else 0.0
+        )
+        out[key] = {
+            "count": len(vals),
+            "mean_reward": round(mean_val, 4),
+            "std_reward": round(std_val, 4),
+        }
+    return out
 
 
 # ── Unified reward dispatcher ─────────────────────────────────────────────────
@@ -505,13 +545,13 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
             r = fn([completion], **sample_kwargs)
             if not r:
                 raise RuntimeError(f"empty reward list for role={role}")
-            rewards.append(r[0])
+            rewards.append(max(-REWARD_CLIP_ABS, min(REWARD_CLIP_ABS, float(r[0]))))
         except Exception as exc:
             msg = f"reward_fn({role}) failed at index={i}: {exc}"
             if failure_mode == "strict":
                 raise RuntimeError(msg) from exc
             print(f"[WARN] {msg}")
-            rewards.append(-1.0)
+            rewards.append(-REWARD_CLIP_ABS)
 
     return rewards
 
@@ -569,6 +609,14 @@ def train(
     )
     print(f"{'='*60}\n")
 
+    # Hold out unseen scenarios for validation/debugging.
+    all_task_ids = [t.task_id for t in ordered_tasks()]
+    holdout_count = max(1, int(round(0.2 * len(all_task_ids)))) if all_task_ids else 0
+    holdout_rng = random.Random(seed + 173)
+    holdout_task_ids = set(holdout_rng.sample(all_task_ids, holdout_count)) if holdout_count else set()
+    if holdout_task_ids:
+        print(f"[INFO] Holdout task set ({len(holdout_task_ids)}): {sorted(holdout_task_ids)}")
+
     # ── 1. Capture pre-training baseline metrics ──────────────────────────────
     if run_eval:
         print("[0/5] Capturing pre-training baseline metrics...")
@@ -602,11 +650,16 @@ def train(
 
     # ── 2b. Base model eval (before any gradient steps) ──────────────────────
     base_model_metrics: Optional[Dict[str, Any]] = None
+    eval_task_ids = sorted(holdout_task_ids) if holdout_task_ids else None
     if run_eval:
         print("\n[1.5/5] Measuring base model score (untrained LoRA)...")
         model.eval()
         base_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=max(1, int(eval_episodes)), tag="BASE MODEL (no fine-tune)"
+            model,
+            tokenizer,
+            n_episodes=max(1, int(eval_episodes)),
+            tag="BASE MODEL (no fine-tune)",
+            eval_task_ids=eval_task_ids,
         )
         model.train()
         _save_json(base_model_metrics, Path(output_dir) / "base_model_metrics.json")
@@ -625,18 +678,40 @@ def train(
         include_adapt=True,
         domain_episode_ratio=0.30,
     )
-    print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+    print(f"    Dataset (pre-split): {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+
+    dataset_train = [
+        s for s in dataset_raw
+        if s.get("task_id") == "domain_transfer" or s.get("task_id") not in holdout_task_ids
+    ]
+    dataset_val = [
+        s for s in dataset_raw
+        if s.get("task_id") in holdout_task_ids
+    ]
+    print(f"    Train samples: {len(dataset_train)} | Holdout samples: {len(dataset_val)}")
 
     role_counts: Dict[str, int] = {}
-    for s in dataset_raw:
+    for s in dataset_train:
         r = s.get("agent_role", "unknown")
         role_counts[r] = role_counts.get(r, 0) + 1
     for role, count in sorted(role_counts.items()):
         print(f"    {role}: {count} samples")
 
+    mut_types: List[str] = []
+    for s in dataset_train:
+        if s.get("agent_role") != AgentRole.GENERATOR.value:
+            continue
+        text = " ".join(m.get("content", "") for m in s.get("prompt", []))
+        for m in re.findall(
+            r"(tighten_window|inject_emergency|increase_weather_penalty|add_atfm_deadline|close_runway_window|add_conflicting_flight)",
+            text,
+        ):
+            mut_types.append(m)
+    print(f"    Generator mutation entropy: {_shannon_entropy(mut_types):.3f} bits")
+
     try:
         from datasets import Dataset
-        dataset = Dataset.from_list(dataset_raw)
+        dataset = Dataset.from_list(dataset_train)
     except ImportError:
         print("[ERROR] pip install datasets")
         sys.exit(1)
@@ -654,6 +729,7 @@ def train(
         "gradient_accumulation_steps":  grad_accum,
         "num_train_epochs":             1,
         "warmup_ratio":                 WARMUP_RATIO,
+        "lr_scheduler_type":            "cosine",
         "logging_steps":                LOGGING_STEPS,
         "save_steps":                   SAVE_STEPS,
         "save_total_limit":             SAVE_TOTAL_LIMIT,
@@ -696,6 +772,71 @@ def train(
     parse_log: Dict[str, List[int]] = {
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": []
     }
+    batch_diagnostics: List[Dict[str, Any]] = []
+    parse_debug_samples: List[Dict[str, Any]] = []
+    action_signature_log: Dict[str, List[str]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": []
+    }
+    difficulty_log: List[float] = []
+
+    def _safe_mean(vals: List[float]) -> float:
+        if not vals:
+            return float("nan")
+        return sum(vals) / len(vals)
+
+    def _safe_std(vals: List[float]) -> float:
+        if len(vals) < 2:
+            return 0.0
+        m = _safe_mean(vals)
+        return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+    def _safe_corr(xs: List[float], ys: List[float]) -> float:
+        n = min(len(xs), len(ys))
+        if n < 3:
+            return float("nan")
+        x = xs[-n:]
+        y = ys[-n:]
+        mx = _safe_mean(x)
+        my = _safe_mean(y)
+        cov = sum((a - mx) * (b - my) for a, b in zip(x, y))
+        sx = math.sqrt(sum((a - mx) ** 2 for a in x))
+        sy = math.sqrt(sum((b - my) ** 2 for b in y))
+        if sx <= 1e-12 or sy <= 1e-12:
+            return float("nan")
+        return cov / (sx * sy)
+
+    def _action_signature(role: str, completion: Any) -> str:
+        try:
+            if role == AgentRole.AMAN.value:
+                action = parse_aman_action(completion)
+                if action is None:
+                    return "parse_fail"
+                runways = sorted({s.runway for s in action.arrival_slots})
+                return f"slots={len(action.arrival_slots)}|rwy={','.join(runways[:3])}|commit={int(action.commit)}"
+            if role == AgentRole.DMAN.value:
+                action = parse_dman_action(completion)
+                if action is None:
+                    return "parse_fail"
+                runways = sorted({s.runway for s in action.departure_slots})
+                return f"slots={len(action.departure_slots)}|rwy={','.join(runways[:3])}|commit={int(action.commit)}"
+            if role == AgentRole.GENERATOR.value:
+                action = parse_generator_action(completion)
+                if action is None:
+                    return "parse_fail"
+                muts = sorted(m.mutation_type.value for m in action.mutations)
+                return f"mut={','.join(muts[:3])}|n={len(muts)}"
+            if role == AgentRole.ADAPT.value:
+                action = parse_adapt_action(completion)
+                if action is None:
+                    return "parse_fail"
+                return f"wake={len(action.entity_wake_map)}|prio={len(action.entity_priority_map)}"
+            if role == AgentRole.SUPERVISOR.value:
+                text = str(completion)
+                ok = bool(re.search(r'"score"\s*:\s*-?\d+(?:\.\d+)?', text))
+                return "score_json" if ok else "parse_fail"
+        except Exception:
+            return "parse_fail"
+        return "unknown"
 
     class RewardLogger:
         __name__ = "combined_reward_fn"
@@ -750,12 +891,74 @@ def train(
                     return 1 if parse_adapt_action(completion) is not None else 0
                 return 0
 
-            for completion, r, role in zip(completions, rewards, roles):
+            role_reward_batch: Dict[str, List[float]] = {k: [] for k in reward_log if k != "composite"}
+            role_parse_batch: Dict[str, List[int]] = {k: [] for k in parse_log}
+            role_sig_batch: Dict[str, List[str]] = {k: [] for k in parse_log}
+            batch_difficulty: List[float] = []
+            raw_difficulty = kwargs.get("difficulty_scalar", [])
+            if not isinstance(raw_difficulty, list):
+                raw_difficulty = [raw_difficulty] * len(rewards)
+
+            for idx, (completion, r, role) in enumerate(zip(completions, rewards, roles)):
                 if role in reward_log:
                     reward_log[role].append(r)
+                    role_reward_batch[role].append(r)
                 if role in parse_log:
-                    parse_log[role].append(_is_parse_ok(role, completion))
+                    parse_ok = _is_parse_ok(role, completion)
+                    parse_log[role].append(parse_ok)
+                    role_parse_batch[role].append(parse_ok)
+                    sig = _action_signature(role, completion)
+                    action_signature_log[role].append(sig)
+                    role_sig_batch[role].append(sig)
+                    if len(parse_debug_samples) < 240 and (
+                        parse_ok == 0 or len(parse_debug_samples) < 40
+                    ):
+                        parse_debug_samples.append(
+                            {
+                                "role": role,
+                                "parse_ok": int(parse_ok),
+                                "reward": round(float(r), 4),
+                                "signature": sig,
+                                "completion_excerpt": str(completion)[:700],
+                            }
+                        )
+                raw_d = _select_sample_value(raw_difficulty, idx)
+                try:
+                    d = max(0.0, min(1.0, float(raw_d)))
+                    difficulty_log.append(d)
+                    batch_difficulty.append(d)
+                except Exception:
+                    pass
                 reward_log["composite"].append(r)
+
+            batch_summary: Dict[str, Any] = {
+                "batch_index": len(batch_diagnostics),
+                "composite_mean": round(_safe_mean(rewards), 4) if rewards else 0.0,
+                "composite_std": round(_safe_std(rewards), 4) if rewards else 0.0,
+                "difficulty_mean": round(_safe_mean(batch_difficulty), 4) if batch_difficulty else None,
+                "parse_rate": {},
+                "action_diversity": {},
+                "reward_distribution": {},
+            }
+            for role_key in ("AMAN", "DMAN", "GENERATOR", "SUPERVISOR", "ADAPT"):
+                prs = role_parse_batch.get(role_key, [])
+                rs = role_reward_batch.get(role_key, [])
+                sigs = [s for s in role_sig_batch.get(role_key, []) if s != "parse_fail"]
+                if prs:
+                    batch_summary["parse_rate"][role_key] = round(_safe_mean(prs), 4)
+                if rs:
+                    batch_summary["reward_distribution"][role_key] = {
+                        "mean": round(_safe_mean(rs), 4),
+                        "std": round(_safe_std(rs), 4),
+                        "min": round(min(rs), 4),
+                        "max": round(max(rs), 4),
+                    }
+                if sigs:
+                    batch_summary["action_diversity"][role_key] = round(
+                        len(set(sigs)) / max(1, len(sigs)),
+                        4,
+                    )
+            batch_diagnostics.append(batch_summary)
 
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
@@ -813,6 +1016,22 @@ def train(
                 tail = vals[-min(window, len(vals)) :]
                 return sum(tail) / max(1, len(tail))
 
+            def _action_diversity(role: str, window: int = 64) -> float:
+                vals = action_signature_log.get(role, [])
+                if not vals:
+                    return float("nan")
+                tail = [v for v in vals[-min(window, len(vals)) :] if v != "parse_fail"]
+                if not tail:
+                    return 0.0
+                return len(set(tail)) / max(1, len(tail))
+
+            def _dist(role: str, window: int = 64) -> str:
+                vals = reward_log.get(role, [])
+                if not vals:
+                    return "n/a"
+                tail = vals[-min(window, len(vals)) :]
+                return f"{min(tail):.2f}/{_safe_mean(tail):.2f}/{max(tail):.2f}"
+
             comp = _avg_last("composite")
             aman = _avg_last("AMAN")
             dman = _avg_last("DMAN")
@@ -820,6 +1039,9 @@ def train(
             sup = _avg_last("SUPERVISOR")
             p_aman = _parse_rate("AMAN")
             p_dman = _parse_rate("DMAN")
+            div_aman = _action_diversity("AMAN")
+            div_dman = _action_diversity("DMAN")
+            corr_rd = _safe_corr(difficulty_log, reward_log.get("composite", []))
             try:
                 rstd_val = float(rstd) if rstd is not None else float("nan")
             except Exception:
@@ -836,6 +1058,12 @@ def train(
                 f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
                 f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
                 f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)}] "
+                f"div64[A={_fmt(div_aman)} D={_fmt(div_dman)}] "
+                f"r64[A={_dist('AMAN')} D={_dist('DMAN')}] "
+                f"corr(reward,d)={_fmt(corr_rd)} "
+                f"samples[A={len(reward_log['AMAN'])} D={len(reward_log['DMAN'])} "
+                f"G={len(reward_log['GENERATOR'])} S={len(reward_log['SUPERVISOR'])} "
+                f"AD={len(reward_log['ADAPT'])}] "
                 f"rstd={_fmt(rstd_val)} zstd_streak={self._zero_std_streak}"
             )
 
@@ -894,6 +1122,21 @@ def train(
     curves_path = Path(output_dir) / "reward_curves.json"
     _save_json(reward_log, curves_path)
     print(f"Reward curves -> {curves_path}")
+    diagnostics_path = Path(output_dir) / "training_diagnostics.json"
+    _save_json(
+        {
+            "reward_log": reward_log,
+            "parse_log": parse_log,
+            "action_signatures": action_signature_log,
+            "difficulty_log": difficulty_log,
+            "batch_diagnostics": batch_diagnostics,
+            "parse_debug_samples": parse_debug_samples,
+            "reward_difficulty_correlation": _safe_corr(difficulty_log, reward_log["composite"]),
+            "reward_by_difficulty_bin": _difficulty_reward_profile(difficulty_log, reward_log["composite"]),
+        },
+        diagnostics_path,
+    )
+    print(f"Diagnostics -> {diagnostics_path}")
 
     _print_final_stats(reward_log)
 
@@ -902,7 +1145,11 @@ def train(
         print("\n[Post] Measuring trained model score...")
         FastLanguageModel.for_inference(model)  # fuse LoRA weights for faster generation
         trained_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=max(1, int(eval_episodes)), tag="TRAINED MODEL"
+            model,
+            tokenizer,
+            n_episodes=max(1, int(eval_episodes)),
+            tag="TRAINED MODEL",
+            eval_task_ids=eval_task_ids,
         )
         _save_json(trained_model_metrics, Path(output_dir) / "trained_model_metrics.json")
 
@@ -1070,6 +1317,7 @@ def _run_model_episodes(
     n_episodes: int = 3,
     tag: str = "MODEL",
     use_generator: bool = False,
+    eval_task_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run multi-agent episodes using an in-process model client.
 
@@ -1084,7 +1332,7 @@ def _run_model_episodes(
     sup = SupervisorAgent()
 
     # Two representative tasks: one easy, one hard
-    eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
+    eval_tasks = eval_task_ids or ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
 
     composites, aman_rews, dman_rews, conflict_list, emg_list = [], [], [], [], []
 

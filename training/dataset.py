@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from engine import simulate_plan
 from models import OperationType, SlotAssignment, TaskDefinition
 from tasks import task_catalog, ordered_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
@@ -222,20 +223,23 @@ def build_episode_dataset(
 
     samples: List[Dict[str, Any]] = []
 
-    for ep_id in range(n_episodes):
-        # ── ADAPT domain sample (stochastic) ────────────────────────────────
-        if include_adapt and rng.random() < domain_episode_ratio:
-            from domains import get_all_domain_tasks
-            from multi_agent.adapt import build_adapt_observation
+    adapt_episode_ids: set[int] = set()
+    domain_tasks: Dict[str, TaskDefinition] = {}
+    if include_adapt:
+        from domains import get_all_domain_tasks
 
-            domain_tasks = get_all_domain_tasks()
-            if domain_tasks:
-                tid = rng.choice(list(domain_tasks.keys()))
-                dtask = domain_tasks[tid]
-                profile = supervisor.sample_profile(ep_id)
-                obs = build_adapt_observation(dtask, profile)
-                samples.append(_make_adapt_sample(ep_id, obs, dtask))
-                continue
+        domain_tasks = get_all_domain_tasks()
+        ratio = max(0.25, min(0.30, max(0.0, float(domain_episode_ratio))))
+        target_adapt = max(0, min(n_episodes, int(round(n_episodes * ratio))))
+        if target_adapt > 0:
+            ep_ids = list(range(n_episodes))
+            rng.shuffle(ep_ids)
+            adapt_episode_ids = set(ep_ids[:target_adapt])
+
+    for ep_id in range(n_episodes):
+        # Difficulty sampled by generator mutate(); labels are logging only.
+        difficulty_scalar = generator.difficulty_scalar
+        difficulty_level = generator.difficulty_level
 
         base_task = rng.choice(task_list)
         profile = supervisor.sample_profile(ep_id)
@@ -243,11 +247,15 @@ def build_episode_dataset(
 
         # Apply generator mutation (rule-based for dataset generation)
         mutated_task, is_solvable = generator.mutate(base_task)
+        mutation_types = generator.last_mutation_types
+        difficulty_scalar = generator.difficulty_scalar
+        difficulty_level = generator.difficulty_level
 
         aman_obs, dman_obs = env.reset(
             episode_id=ep_id,
             supervisor_profile=profile,
             mutated_task=mutated_task,
+            randomize=True,
         )
 
         atfm_json = json.dumps(env._state.atfm_deadlines)
@@ -261,6 +269,7 @@ def build_episode_dataset(
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
+            difficulty_scalar=difficulty_scalar,
         ))
 
         # DMAN BID sample
@@ -272,6 +281,7 @@ def build_episode_dataset(
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
+            difficulty_scalar=difficulty_scalar,
         ))
 
         # Generator sample
@@ -282,6 +292,8 @@ def build_episode_dataset(
                 profile=profile,
                 difficulty_level=generator.difficulty_level,
                 ema_score=generator.ema_score,
+                difficulty_scalar=difficulty_scalar,
+                difficulty_distribution=generator.difficulty_distribution,
             ))
 
         # Supervisor sample (uses a dummy merged plan for dataset; real plan used at inference)
@@ -291,10 +303,22 @@ def build_episode_dataset(
                 task=mutated_task,
                 profile=profile,
                 sup_desc=sup_desc,
+                difficulty_scalar=difficulty_scalar,
             ))
 
-        # Simulate a mid-score episode to update generator curriculum
-        generator.update(rng.uniform(0.25, 0.75))
+        # Add ADAPT sample on selected episodes without removing controller samples.
+        if include_adapt and ep_id in adapt_episode_ids and domain_tasks:
+            from multi_agent.adapt import build_adapt_observation
+
+            tid = rng.choice(list(domain_tasks.keys()))
+            dtask = domain_tasks[tid]
+            obs = build_adapt_observation(dtask, profile)
+            samples.append(_make_adapt_sample(ep_id, obs, dtask, difficulty_scalar=difficulty_scalar))
+
+        # Update curriculum using deterministic proxy performance signal.
+        controller_score = _estimate_controller_score(mutated_task)
+        generator.update(controller_score)
+        generator.record(base_task.task_id, mutation_types, controller_score)
 
     return samples
 
@@ -309,6 +333,7 @@ def _make_aman_sample(
     sup_desc: str,
     profile: SupervisorProfileName,
     round_name: str,
+    difficulty_scalar: float,
 ) -> Dict[str, Any]:
     system = AMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
     user = obs.to_prompt_text()
@@ -324,6 +349,7 @@ def _make_aman_sample(
         "supervisor_profile": profile.value,
         "atfm_deadlines_json": atfm_json,
         "dman_slots_json":    dman_slots_json,
+        "difficulty_scalar":  float(difficulty_scalar),
     }
 
 
@@ -335,6 +361,7 @@ def _make_dman_sample(
     sup_desc: str,
     profile: SupervisorProfileName,
     round_name: str,
+    difficulty_scalar: float,
 ) -> Dict[str, Any]:
     system = DMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
     user = obs.to_prompt_text()
@@ -350,6 +377,7 @@ def _make_dman_sample(
         "supervisor_profile": profile.value,
         "atfm_deadlines_json": atfm_json,
         "aman_slots_json":    aman_slots_json,
+        "difficulty_scalar":  float(difficulty_scalar),
     }
 
 
@@ -359,9 +387,14 @@ def _make_generator_sample(
     profile: SupervisorProfileName,
     difficulty_level: int,
     ema_score: float,
+    difficulty_scalar: float,
+    difficulty_distribution: Dict[str, float],
 ) -> Dict[str, Any]:
     user_content = (
         f"Current agent performance (EMA): {ema_score:.2f}\n"
+        f"Current scalar difficulty d: {difficulty_scalar:.3f}\n"
+        f"Difficulty distribution Beta(alpha={difficulty_distribution.get('alpha', 1.0):.2f}, "
+        f"beta={difficulty_distribution.get('beta', 1.0):.2f})\n"
         f"Target difficulty level: {difficulty_level}/6\n\n"
         f"Base task: {task.task_id} ({task.difficulty.value})\n"
         f"Flights: {len(task.flights)} | Runways: {len(task.runways)}\n"
@@ -380,6 +413,7 @@ def _make_generator_sample(
         "round":              "generate",
         "supervisor_profile": profile.value,
         "controller_scores":  ema_score,
+        "difficulty_scalar":  float(difficulty_scalar),
     }
 
 
@@ -388,6 +422,7 @@ def _make_supervisor_sample(
     task,
     profile: SupervisorProfileName,
     sup_desc: str,
+    difficulty_scalar: float,
 ) -> Dict[str, Any]:
     merged_plan_json = _build_reference_merged_plan_json(task)
     system = SUPERVISOR_SYSTEM_TEMPLATE.format(preference=sup_desc)
@@ -407,6 +442,7 @@ def _make_supervisor_sample(
         "round":              "evaluate",
         "supervisor_profile": profile.value,
         "merged_plan_json":   merged_plan_json,
+        "difficulty_scalar":  float(difficulty_scalar),
     }
 
 
@@ -432,7 +468,12 @@ def _build_reference_merged_plan_json(task) -> str:
     return json.dumps(slots)
 
 
-def _make_adapt_sample(ep_id: int, obs: ADAPTObservation, domain_task: TaskDefinition) -> Dict[str, Any]:
+def _make_adapt_sample(
+    ep_id: int,
+    obs: ADAPTObservation,
+    domain_task: TaskDefinition,
+    difficulty_scalar: float,
+) -> Dict[str, Any]:
     return {
         "prompt": [
             {"role": "system", "content": ADAPT_SYSTEM},
@@ -443,7 +484,33 @@ def _make_adapt_sample(ep_id: int, obs: ADAPTObservation, domain_task: TaskDefin
         "round": "adapt",
         "domain_task_json": domain_task.model_dump_json(),
         "supervisor_profile": obs.supervisor_profile_name.value,
+        "difficulty_scalar": float(difficulty_scalar),
     }
+
+
+def _estimate_controller_score(task: TaskDefinition) -> float:
+    """Deterministic proxy controller performance for curriculum updates."""
+    slots = []
+    for flight in task.flights:
+        if not flight.allowed_runways:
+            continue
+        assigned_minute = max(
+            int(flight.earliest_minute),
+            min(int(flight.latest_minute), int(flight.scheduled_minute)),
+        )
+        slots.append(
+            SlotAssignment(
+                flight_id=str(flight.flight_id),
+                runway=str(flight.allowed_runways[0]),
+                assigned_minute=int(assigned_minute),
+                hold_minutes=max(0, abs(assigned_minute - int(flight.scheduled_minute))),
+            )
+        )
+    try:
+        outcome = simulate_plan(task, slots)
+        return max(0.0, min(1.0, float(outcome.normalized_score)))
+    except Exception:
+        return 0.5
 
 
 # ── Action parsers (completion → typed action) ────────────────────────────────

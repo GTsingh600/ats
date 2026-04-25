@@ -520,7 +520,12 @@ def test_adapt_reward_batch_length_matches(mass_casualty_task):
 def test_make_adapt_sample_structure(normal_task, normal_obs):
     from training.dataset import _make_adapt_sample
 
-    sample = _make_adapt_sample(ep_id=0, obs=normal_obs, domain_task=normal_task)
+    sample = _make_adapt_sample(
+        ep_id=0,
+        obs=normal_obs,
+        domain_task=normal_task,
+        difficulty_scalar=0.3,
+    )
     assert "prompt" in sample
     assert len(sample["prompt"]) == 2
     assert sample["prompt"][0]["role"] == "system"
@@ -533,7 +538,12 @@ def test_make_adapt_sample_structure(normal_task, normal_obs):
 def test_make_adapt_sample_prompt_contains_structural_profiles(normal_task, normal_obs):
     from training.dataset import _make_adapt_sample
 
-    sample = _make_adapt_sample(ep_id=5, obs=normal_obs, domain_task=normal_task)
+    sample = _make_adapt_sample(
+        ep_id=5,
+        obs=normal_obs,
+        domain_task=normal_task,
+        difficulty_scalar=0.4,
+    )
     user_content = sample["prompt"][1]["content"]
     assert "time_pressure" in user_content
     assert "connection_risk" in user_content
@@ -542,7 +552,12 @@ def test_make_adapt_sample_prompt_contains_structural_profiles(normal_task, norm
 def test_make_adapt_sample_system_contains_structural_guide(normal_task, normal_obs):
     from training.dataset import ADAPT_SYSTEM, _make_adapt_sample
 
-    sample = _make_adapt_sample(ep_id=0, obs=normal_obs, domain_task=normal_task)
+    sample = _make_adapt_sample(
+        ep_id=0,
+        obs=normal_obs,
+        domain_task=normal_task,
+        difficulty_scalar=0.5,
+    )
     sys_content = sample["prompt"][0]["content"]
     assert "STRUCTURAL" in sys_content
     assert "entity_wake_map" in sys_content
@@ -552,7 +567,12 @@ def test_make_adapt_sample_system_contains_structural_guide(normal_task, normal_
 def test_make_adapt_sample_domain_task_json_valid(normal_task, normal_obs):
     from training.dataset import _make_adapt_sample
 
-    sample = _make_adapt_sample(ep_id=0, obs=normal_obs, domain_task=normal_task)
+    sample = _make_adapt_sample(
+        ep_id=0,
+        obs=normal_obs,
+        domain_task=normal_task,
+        difficulty_scalar=0.6,
+    )
     from models import TaskDefinition
     restored = TaskDefinition.model_validate_json(sample["domain_task_json"])
     assert restored.task_id == normal_task.task_id
