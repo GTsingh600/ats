@@ -291,14 +291,17 @@ def train(
         "per_device_train_batch_size":  BATCH_SIZE,
         "gradient_accumulation_steps":  GRAD_ACCUM,
         "num_train_epochs":             1,
-        "warmup_ratio":                 WARMUP_RATIO,
+        "warmup_steps":                 max(1, int(WARMUP_RATIO * max(1, n_episodes // (BATCH_SIZE * GRAD_ACCUM)))),
         "logging_steps":                10,
         "save_steps":                   SAVE_STEPS,
         "save_total_limit":             SAVE_TOTAL_LIMIT,
         "output_dir":                   output_dir,
         "run_name":                     f"atc-multiagent-grpo-{int(time.time())}",
-        "bf16":                         torch.cuda.is_bf16_supported(),
-        "fp16":                         not torch.cuda.is_bf16_supported(),
+        # T4 (Turing CC 7.5) reports is_bf16_supported()=True in newer PyTorch
+        # but AMP GradScaler's unscale_ is not implemented for BFloat16 on CC < 8.
+        # Only Ampere (CC 8.0+) can run bf16 AMP correctly; use fp16 on older GPUs.
+        "bf16":                         torch.cuda.get_device_capability()[0] >= 8,
+        "fp16":                         torch.cuda.get_device_capability()[0] < 8,
         "gradient_checkpointing":       True,
         "optim":                        "paged_adamw_8bit",
     }
