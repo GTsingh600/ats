@@ -395,37 +395,86 @@ def _coerce_completion_text(completion: Any) -> str:
 
 
 def _extract_json(text: Any) -> Optional[str]:
-    """Extract first JSON object from an LLM completion."""
+    """Extract first JSON object from an LLM completion.
+
+    Handles the most common LLM output quirks:
+      - markdown fences (```json, ```JSON, ```)
+      - Python literals: True/False/None → true/false/null
+      - single-quote dicts  → double-quote JSON (ast fallback)
+    """
     text = _coerce_completion_text(text)
-    text = re.sub(r"```(?:json)?", "", text).strip()
+    # Strip all markdown code fences regardless of language tag or case
+    text = re.sub(r"```[a-zA-Z]*\s*", "", text)
+    text = re.sub(r"```", "", text).strip()
+
     match = re.search(r"\{.*\}", text, re.DOTALL)
-    return match.group(0) if match else None
+    if not match:
+        return None
+
+    raw = match.group(0)
+    # Normalise Python literals so json.loads can parse them
+    # Use word-boundary replacements to avoid mangling string values
+    raw = re.sub(r"\bTrue\b",  "true",  raw)
+    raw = re.sub(r"\bFalse\b", "false", raw)
+    raw = re.sub(r"\bNone\b",  "null",  raw)
+    return raw
+
+
+def _loads_lenient(raw: str) -> Optional[dict]:
+    """json.loads with ast.literal_eval fallback for single-quote dicts."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            import ast
+            obj = ast.literal_eval(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+
+def _safe_slot(s: dict, op: str) -> Optional[SlotAssignment]:
+    """Build a SlotAssignment tolerating wrong field types from LLM output."""
+    try:
+        return SlotAssignment(
+            flight_id=str(s.get("flight_id", "")),
+            runway=str(s.get("runway", "")),
+            assigned_minute=int(float(s.get("assigned_minute", 0))),
+            hold_minutes=int(float(s.get("hold_minutes", 0))),
+        )
+    except Exception:
+        return None
 
 
 def parse_aman_action(completion: Any) -> Optional[AMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
+    data = _loads_lenient(raw)
+    if not isinstance(data, dict):
+        return None
     try:
-        data = json.loads(raw)
-        slots = [SlotAssignment(**s) for s in data.get("arrival_slots", [])]
-        msgs  = [
-            NegotiationMessage(
-                from_role=AgentRole.AMAN,
-                message_type=MessageType(m.get("message_type", "runway_claim")),
-                flight_id=m.get("flight_id", ""),
-                requested_minute=int(m.get("requested_minute", 0)),
-                runway_id=m.get("runway_id", ""),
-                priority=m.get("priority", "normal"),
-                reason=m.get("reason", ""),
-                is_emergency=bool(m.get("is_emergency", False)),
-            )
-            for m in data.get("outgoing_messages", [])
-        ]
+        # Per-slot try/except: one bad slot skips that slot, not the whole action
+        slots = [s for s in (_safe_slot(x, "arrival") for x in data.get("arrival_slots", [])) if s]
+        msgs = []
+        for m in data.get("outgoing_messages", []):
+            try:
+                msgs.append(NegotiationMessage(
+                    from_role=AgentRole.AMAN,
+                    message_type=MessageType(m.get("message_type", "runway_claim")),
+                    flight_id=str(m.get("flight_id", "")),
+                    requested_minute=int(float(m.get("requested_minute", 0))),
+                    runway_id=str(m.get("runway_id", "")),
+                    priority=str(m.get("priority", "normal")),
+                    reason=str(m.get("reason", "")),
+                    is_emergency=bool(m.get("is_emergency", False)),
+                ))
+            except Exception:
+                continue
         return AMANAction(
             arrival_slots=slots,
-            rationale=data.get("rationale", ""),
-            emergency_yields=data.get("emergency_yields", []),
+            rationale=str(data.get("rationale", "")),
+            emergency_yields=list(data.get("emergency_yields", [])),
             outgoing_messages=msgs,
             commit=bool(data.get("commit", False)),
         )
@@ -437,27 +486,31 @@ def parse_dman_action(completion: Any) -> Optional[DMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
+    data = _loads_lenient(raw)
+    if not isinstance(data, dict):
+        return None
     try:
-        data = json.loads(raw)
-        slots = [SlotAssignment(**s) for s in data.get("departure_slots", [])]
-        msgs  = [
-            NegotiationMessage(
-                from_role=AgentRole.DMAN,
-                message_type=MessageType(m.get("message_type", "runway_claim")),
-                flight_id=m.get("flight_id", ""),
-                requested_minute=int(m.get("requested_minute", 0)),
-                runway_id=m.get("runway_id", ""),
-                priority=m.get("priority", "normal"),
-                reason=m.get("reason", ""),
-                is_emergency=bool(m.get("is_emergency", False)),
-            )
-            for m in data.get("outgoing_messages", [])
-        ]
+        slots = [s for s in (_safe_slot(x, "departure") for x in data.get("departure_slots", [])) if s]
+        msgs = []
+        for m in data.get("outgoing_messages", []):
+            try:
+                msgs.append(NegotiationMessage(
+                    from_role=AgentRole.DMAN,
+                    message_type=MessageType(m.get("message_type", "runway_claim")),
+                    flight_id=str(m.get("flight_id", "")),
+                    requested_minute=int(float(m.get("requested_minute", 0))),
+                    runway_id=str(m.get("runway_id", "")),
+                    priority=str(m.get("priority", "normal")),
+                    reason=str(m.get("reason", "")),
+                    is_emergency=bool(m.get("is_emergency", False)),
+                ))
+            except Exception:
+                continue
         return DMANAction(
             departure_slots=slots,
-            rationale=data.get("rationale", ""),
-            atfm_compliance=data.get("atfm_compliance", {}),
-            emergency_broadcasts=data.get("emergency_broadcasts", []),
+            rationale=str(data.get("rationale", "")),
+            atfm_compliance=dict(data.get("atfm_compliance", {})),
+            emergency_broadcasts=list(data.get("emergency_broadcasts", [])),
             outgoing_messages=msgs,
             commit=bool(data.get("commit", False)),
         )

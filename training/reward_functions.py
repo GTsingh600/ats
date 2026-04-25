@@ -512,8 +512,12 @@ def _json_format_score(completion: Any) -> float:
     """Returns 1.0 if completion contains valid JSON with expected keys, else 0.0."""
     text = _coerce_completion_text(completion)
     try:
-        # Strip markdown code fences if present
-        stripped = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
+        stripped = re.sub(r"```[a-zA-Z]*\s*", "", text)
+        stripped = re.sub(r"```", "", stripped).strip()
+        # Normalise Python literals before parsing
+        stripped = re.sub(r"\bTrue\b", "true", stripped)
+        stripped = re.sub(r"\bFalse\b", "false", stripped)
+        stripped = re.sub(r"\bNone\b", "null", stripped)
         data = json.loads(stripped)
         if isinstance(data, dict) and (
             "arrival_slots" in data or "departure_slots" in data or "rationale" in data
@@ -528,28 +532,51 @@ def _json_format_score(completion: Any) -> float:
 
 
 def _parse_partial_credit(completion: Any) -> float:
-    """Partial credit when JSON parsing fails, preventing GRPO advantage collapse.
+    """Partial credit for completions that fail JSON parsing.
 
-    When all completions in a GRPO group fail to parse, returning the same -0.8
-    makes group std=0 → advantage=0 → zero gradient. This function returns
-    0.0–0.18 based on structural quality, keeping rewards in [-0.80, -0.62].
+    GRPO advantage = (r - mean) / std. If ALL completions in a group get
+    identical rewards, std=0 → advantage=0 → zero gradient. This function
+    ensures rewards in [-0.80, -0.62] vary even when parsing fails completely,
+    including when the model outputs natural language instead of JSON.
+
+    Credit tiers (cumulative, capped at 0.18):
+      +0.03  any substantive text (> 20 chars)
+      +0.02  longer response (> 100 chars, shows more effort)
+      +0.04  has { (attempted JSON)
+      +0.05  has slot key (arrival_slots / departure_slots / slots)
+      +0.04  has flight_id key or pattern
+      +0.03  has runway key or pattern
+      +0.02  has rationale key
+      -0.04  very short (< 20 chars, penalise lazy/empty outputs)
     """
     text = _coerce_completion_text(completion)
-    if not text:
+    if not text or not text.strip():
         return 0.0
+
+    tl = text.lower()
     score = 0.0
+
+    # Natural-language responses still get some credit so they vary from empty
+    if len(text.strip()) > 20:
+        score += 0.03
+    if len(text.strip()) > 100:
+        score += 0.02
+
+    # JSON structure markers
     if "{" in text:
         score += 0.04
-    if any(k in text for k in ('"slots"', '"arrival_slots"', '"departure_slots"')):
+    if any(k in tl for k in ("arrival_slots", "departure_slots", '"slots"', "'slots'")):
         score += 0.05
-    if '"flight_id"' in text:
+    if "flight_id" in tl:
         score += 0.04
-    if '"runway"' in text:
+    if "runway" in tl:
         score += 0.03
-    if '"rationale"' in text:
+    if "rationale" in tl:
         score += 0.02
-    if len(text.strip()) < 30:
+
+    if len(text.strip()) < 20:
         score = max(0.0, score - 0.04)
+
     return round(min(0.18, score), 4)
 
 

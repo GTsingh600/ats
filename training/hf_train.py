@@ -40,6 +40,10 @@ def _dockerfile(
     seed: int,
     hf_output_repo: str,
 ) -> str:
+    # Secrets (GITHUB_TOKEN, HF_TOKEN) are NOT available at Docker build time —
+    # they only exist at container runtime. So we:
+    #   Build time  → install OS packages + pip deps (cached across restarts)
+    #   Runtime CMD → git clone (uses GITHUB_TOKEN secret) then train
     return textwrap.dedent(f"""\
         FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
@@ -54,14 +58,9 @@ def _dockerfile(
             && ln -sf /usr/bin/python3.11 /usr/bin/python3 \\
             && rm -rf /var/lib/apt/lists/*
 
-        WORKDIR /app
-
-        # Clone the training repo
-        RUN git clone --branch {repo_branch} --depth 1 {repo_url} /app/repo
-
-        WORKDIR /app/repo
-
-        # ── Install deps in correct order (unsloth first, no --no-deps) ──────
+        # ── Pre-install Python deps at build time (cached) ───────────────────
+        # unsloth must be installed WITHOUT --no-deps so it pins the right
+        # transformers version (avoids the retry ImportError at runtime).
         RUN pip install --no-cache-dir unsloth==2026.4.7 unsloth-zoo==2026.4.9
         RUN pip install --no-cache-dir --no-deps \\
             trl==0.16.0 accelerate==1.13.0 peft==0.19.1 \\
@@ -71,18 +70,35 @@ def _dockerfile(
         RUN pip install --no-cache-dir \\
             wandb openenv-core fastapi pydantic uvicorn matplotlib numpy
 
-        # ── Training entrypoint ───────────────────────────────────────────────
-        # train_grpo.py streams live reward output; results pushed to HF Hub.
-        CMD python training/train_grpo.py \\
+        WORKDIR /app
+
+        # ── Runtime entrypoint ────────────────────────────────────────────────
+        # GITHUB_TOKEN and HF_TOKEN are injected as Space secrets at runtime.
+        # Public repo: GITHUB_TOKEN not needed (leave blank in Space settings).
+        # Private repo: set GITHUB_TOKEN in Space Settings -> Variables & Secrets.
+        CMD bash -c ' \\
+            set -e; \\
+            echo "=== Cloning repo ==="; \\
+            if [ -n "${{GITHUB_TOKEN}}" ]; then \\
+                CLONE_URL="https://${{GITHUB_TOKEN}}@github.com/{repo_url.replace("https://github.com/", "")}"; \\
+            else \\
+                CLONE_URL="{repo_url}"; \\
+            fi; \\
+            git clone --branch {repo_branch} --depth 1 "$CLONE_URL" /app/repo; \\
+            cd /app/repo; \\
+            echo "=== Starting training ==="; \\
+            python training/train_grpo.py \\
                 --model        "{model}" \\
                 --output_dir   /app/outputs \\
                 --episodes     {episodes} \\
                 --n_generations {n_generations} \\
                 --lora_rank    {lora_rank} \\
-                --seed         {seed} \\
-            && python /app/repo/training/hf_push_outputs.py \\
+                --seed         {seed}; \\
+            echo "=== Pushing outputs ==="; \\
+            python /app/repo/training/hf_push_outputs.py \\
                 --output_dir /app/outputs \\
-                --repo_id    "{hf_output_repo}"
+                --repo_id    "{hf_output_repo}"; \\
+        '
     """)
 
 
@@ -130,8 +146,10 @@ def _hf_api(token: str):
 
 
 def _ensure_repo(api, repo_id: str, repo_type: str) -> str:
-    url = api.create_repo(repo_id=repo_id, repo_type=repo_type,
-                          exist_ok=True, private=True)
+    kwargs = dict(repo_id=repo_id, repo_type=repo_type, exist_ok=True, private=True)
+    if repo_type == "space":
+        kwargs["space_sdk"] = "docker"
+    url = api.create_repo(**kwargs)
     print(f"Repo ready: {url}")
     return url
 
@@ -142,20 +160,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Launch ATC GRPO on HF Spaces GPU")
     parser.add_argument("--hf_token",      required=True,  help="HuggingFace write token")
     parser.add_argument("--hf_user",       required=True,  help="HF username")
-    parser.add_argument("--repo_url",      default="https://github.com/GTsingh600/ATC.git")
-    parser.add_argument("--repo_branch",   default="yashh")
+    parser.add_argument("--repo_url",      default="https://github.com/GTsingh600/ats.git")
+    parser.add_argument("--repo_branch",   default="main")
     parser.add_argument("--model",         default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--episodes",      type=int, default=150)
     parser.add_argument("--n_generations", type=int, default=4)
     parser.add_argument("--lora_rank",     type=int, default=16)
     parser.add_argument("--seed",          type=int, default=42)
     parser.add_argument("--hardware",      default="t4-small",
-                        choices=["cpu-basic", "t4-small", "t4-medium", "a10g-small",
-                                 "a10g-large", "a100-large"],
-                        help="HF Spaces hardware tier")
+                        help=("HF Spaces hardware tier. Common values: "
+                              "t4-small, t4-medium, a10g-small, a10g-large, "
+                              "a100-large, l40s-small, l40s-large. "
+                              "HF validates the value — if wrong, the Space will fail to start."))
     parser.add_argument("--space_name",    default="atc-grpo-runner")
     parser.add_argument("--adapter_name",  default="atc-grpo-adapter")
     parser.add_argument("--wandb_key",     default="", help="Optional W&B API key")
+    parser.add_argument("--github_token",  default="",
+                        help="GitHub PAT for private repo clone. "
+                             "Leave empty if repo is public.")
     args = parser.parse_args()
 
     space_repo_id   = f"{args.hf_user}/{args.space_name}"
@@ -193,11 +215,12 @@ def main() -> None:
                 lora_rank=args.lora_rank,
                 seed=args.seed,
                 hf_output_repo=adapter_repo_id,
-            )
+            ),
+            encoding="utf-8",
         )
 
         # Push script (runs inside container after training)
-        (tmp / "hf_push_outputs.py").write_text(PUSH_SCRIPT)
+        (tmp / "hf_push_outputs.py").write_text(PUSH_SCRIPT, encoding="utf-8")
 
         # README for Space (required by HF)
         (tmp / "README.md").write_text(textwrap.dedent(f"""\
@@ -212,7 +235,7 @@ def main() -> None:
             [{adapter_repo_id}](https://huggingface.co/{adapter_repo_id}).
 
             Model: `{args.model}` · Episodes: `{args.episodes}`
-        """))
+        """), encoding="utf-8")
 
         api.upload_folder(
             folder_path=str(tmp),
@@ -229,15 +252,20 @@ def main() -> None:
         print(f"  [WARN] Could not set hardware automatically: {e}")
         print(f"  Set it manually: https://huggingface.co/spaces/{space_repo_id}/settings")
 
-    # Push HF_TOKEN as a Space secret so the push script can authenticate
+    # Inject secrets — available to the container at runtime (not at build time)
     try:
-        api.add_space_secret(repo_id=space_repo_id, key="HF_TOKEN",   value=args.hf_token)
+        secrets_added = ["HF_TOKEN"]
+        api.add_space_secret(repo_id=space_repo_id, key="HF_TOKEN", value=args.hf_token)
+        if args.github_token:
+            api.add_space_secret(repo_id=space_repo_id, key="GITHUB_TOKEN", value=args.github_token)
+            secrets_added.append("GITHUB_TOKEN")
         if args.wandb_key:
             api.add_space_secret(repo_id=space_repo_id, key="WANDB_API_KEY", value=args.wandb_key)
-        print("  Secrets added (HF_TOKEN" + (", WANDB_API_KEY" if args.wandb_key else "") + ")")
+            secrets_added.append("WANDB_API_KEY")
+        print(f"  Secrets added: {', '.join(secrets_added)}")
     except Exception as e:
         print(f"  [WARN] Could not add secrets automatically: {e}")
-        print(f"  Add HF_TOKEN manually in Space settings.")
+        print(f"  Add HF_TOKEN (and GITHUB_TOKEN if repo is private) in Space settings.")
 
     # ── 4. Done ───────────────────────────────────────────────────────────────
     print("[4/4] Done.\n")
