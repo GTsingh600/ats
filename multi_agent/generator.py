@@ -381,7 +381,7 @@ class ChallengeGenerator:
 
     def _inject_emergency(self, task: TaskDefinition, mut: GeneratorMutation) -> TaskDefinition:
         p = mut.params
-        fid = p.get("flight_id", "EMG001")
+        fid = str(p.get("flight_id", "EMG001"))  # LLM may emit int — always coerce
         minute = int(p.get("minute", 20))
         priority_str = str(p.get("priority", "emergency")).lower().strip()
         priority_str = _PRIORITY_ALIASES.get(priority_str, priority_str)
@@ -410,7 +410,7 @@ class ChallengeGenerator:
 
     def _add_conflicting_flight(self, task: TaskDefinition, mut: GeneratorMutation) -> TaskDefinition:
         p = mut.params
-        fid = p.get("flight_id", "WKT001")
+        fid = str(p.get("flight_id", "WKT001"))  # LLM may emit int — always coerce
         minute = int(p.get("minute", 10))
         try:
             wake = WakeClass(str(p.get("wake_class", "H")).upper())
