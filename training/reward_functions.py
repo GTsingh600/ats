@@ -241,6 +241,7 @@ def aman_reward_fn(
                 missing += 1
 
         arr_count = max(1, len(arrivals))
+        parsed_slot_count = len(aman_action.arrival_slots)
         emg_total = sum(
             1 for f in arrivals if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
         )
@@ -270,6 +271,10 @@ def aman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
+        parse_valid_bonus = 0.08
+        slot_validity = min(1.0, parsed_slot_count / arr_count)
+        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
+        long_horizon_gate = max(0.25, parse_progress)
         long_horizon = _weighted_active_mean(
             [
                 (outcome.metrics.connection_impact_score, 0.45, True),
@@ -288,17 +293,17 @@ def aman_reward_fn(
                 (sup_align, 0.06, True),
                 (rationale_score, 0.05, True),
                 (json_fmt, 0.04, True),
-                (long_horizon, 0.06, True),
+                (long_horizon * long_horizon_gate, 0.06, True),
             ]
-        ) - cross_penalty - _length_budget_penalty("AMAN", completion)
-
-        # Layered safety gates — hard ceilings that cannot be bought off by efficiency
-        if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
-        if emg_miss > 0:
-            reward = min(reward, 0.40)   # emergency hard gate
-        if coverage < 0.50:
-            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+        )
+        reward += parse_valid_bonus
+        reward -= cross_penalty
+        reward -= _length_budget_penalty("AMAN", completion)
+        # Smooth safety penalties preserve ranking signal for GRPO.
+        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
+        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
+        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
+        reward -= conflict_penalty + emg_penalty + coverage_penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -312,10 +317,13 @@ def aman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
+                "parse_valid_bonus": parse_valid_bonus,
+                "slot_validity": slot_validity,
+                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_gate": int(outcome.metrics.conflict_count > 0),
-                "emg_gate": int(emg_miss > 0),
-                "coverage_floor": int(coverage < 0.50),
+                "conflict_penalty": -conflict_penalty,
+                "emg_penalty": -emg_penalty,
+                "coverage_penalty": -coverage_penalty,
                 "final_reward": reward,
             },
         )
@@ -401,6 +409,7 @@ def dman_reward_fn(
                 missing += 1
 
         dep_count = max(1, len(departures))
+        parsed_slot_count = len(dman_action.departure_slots)
         emg_total = sum(
             1 for f in departures if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
         )
@@ -430,6 +439,10 @@ def dman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
+        parse_valid_bonus = 0.08
+        slot_validity = min(1.0, parsed_slot_count / dep_count)
+        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
+        long_horizon_gate = max(0.25, parse_progress)
         long_horizon = _weighted_active_mean(
             [
                 (outcome.metrics.connection_impact_score, 0.45, True),
@@ -449,17 +462,16 @@ def dman_reward_fn(
                 (sup_align, 0.05, True),
                 (rationale_score, 0.04, True),
                 (json_fmt, 0.03, True),
-                (long_horizon, 0.05, True),
+                (long_horizon * long_horizon_gate, 0.05, True),
             ]
-        ) - cross_penalty - _length_budget_penalty("DMAN", completion)
-
-        # Layered safety gates
-        if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
-        if emg_miss > 0:
-            reward = min(reward, 0.40)   # emergency hard gate
-        if coverage < 0.50:
-            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+        )
+        reward += parse_valid_bonus
+        reward -= cross_penalty
+        reward -= _length_budget_penalty("DMAN", completion)
+        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
+        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
+        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
+        reward -= conflict_penalty + emg_penalty + coverage_penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -474,10 +486,13 @@ def dman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
+                "parse_valid_bonus": parse_valid_bonus,
+                "slot_validity": slot_validity,
+                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_gate": int(outcome.metrics.conflict_count > 0),
-                "emg_gate": int(emg_miss > 0),
-                "coverage_floor": int(coverage < 0.50),
+                "conflict_penalty": -conflict_penalty,
+                "emg_penalty": -emg_penalty,
+                "coverage_penalty": -coverage_penalty,
                 "final_reward": reward,
             },
         )

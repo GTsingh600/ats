@@ -430,17 +430,53 @@ def _extract_json(text: Any) -> Optional[str]:
     text = re.sub(r"```[a-zA-Z]*\s*", "", text)
     text = re.sub(r"```", "", text).strip()
 
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return None
+    candidates = _extract_balanced_json_candidates(text)
+    for raw in candidates:
+        # Normalise Python literals so json.loads can parse them
+        # Use word-boundary replacements to avoid mangling string values
+        norm = re.sub(r"\bTrue\b", "true", raw)
+        norm = re.sub(r"\bFalse\b", "false", norm)
+        norm = re.sub(r"\bNone\b", "null", norm)
+        if _loads_lenient(norm) is not None:
+            return norm
+    return None
 
-    raw = match.group(0)
-    # Normalise Python literals so json.loads can parse them
-    # Use word-boundary replacements to avoid mangling string values
-    raw = re.sub(r"\bTrue\b",  "true",  raw)
-    raw = re.sub(r"\bFalse\b", "false", raw)
-    raw = re.sub(r"\bNone\b",  "null",  raw)
-    return raw
+
+def _extract_balanced_json_candidates(text: str) -> List[str]:
+    """Extract balanced {...} object candidates from a completion."""
+    candidates: List[str] = []
+    start = None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(text[start : idx + 1])
+                    start = None
+    if not candidates:
+        # Fallback keeps previous behavior when braces are malformed.
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            candidates.append(match.group(0))
+    return candidates
 
 
 def _loads_lenient(raw: str) -> Optional[dict]:

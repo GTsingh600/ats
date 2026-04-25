@@ -123,6 +123,12 @@ WARMUP_RATIO   = 0.05
 LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
+EVAL_EPISODES  = 20
+STAGE_EPOCHS = {
+    "stage_a": 0.45,  # AMAN + DMAN only
+    "stage_b": 0.30,  # add sampled generator/supervisor
+    "stage_c": 0.25,  # full 4-role mix
+}
 
 
 def _configure_runtime_warnings() -> None:
@@ -475,6 +481,74 @@ def _select_sample_value(value: Any, index: int) -> Any:
     return value
 
 
+def _expand_to_completion_length(
+    value: Any,
+    target_len: int,
+    *,
+    field_name: str,
+    num_generations: int,
+) -> List[Any]:
+    """Align prompt-level metadata with completion-level batches."""
+    if not isinstance(value, list):
+        return [value] * target_len
+    current_len = len(value)
+    if current_len == target_len:
+        return value
+    if current_len == 0:
+        return [None] * target_len
+    if current_len * max(1, num_generations) == target_len:
+        expanded: List[Any] = []
+        for item in value:
+            expanded.extend([item] * max(1, num_generations))
+        return expanded
+    if target_len % current_len == 0:
+        factor = target_len // current_len
+        expanded = []
+        for item in value:
+            expanded.extend([item] * factor)
+        return expanded
+    raise RuntimeError(
+        f"Metadata alignment error for '{field_name}': len={current_len}, "
+        f"target={target_len}, num_generations={num_generations}"
+    )
+
+
+def _build_curriculum_slices(dataset_raw: List[Dict[str, Any]], seed: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Create staged role mixes for pure-GRPO curriculum."""
+    import random
+
+    rng = random.Random(seed)
+    stage_a = [
+        row for row in dataset_raw
+        if row.get("agent_role") in (AgentRole.AMAN.value, AgentRole.DMAN.value)
+    ]
+    gen_sup = [
+        row for row in dataset_raw
+        if row.get("agent_role") in (AgentRole.GENERATOR.value, AgentRole.SUPERVISOR.value)
+    ]
+    rng.shuffle(gen_sup)
+    keep = int(0.35 * len(gen_sup))
+    stage_b = stage_a + gen_sup[:keep]
+    stage_c = list(dataset_raw)
+    return {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+
+
+def _tail_rate(values: List[int], window: int = 128) -> float:
+    if not values:
+        return 0.0
+    tail = values[-min(window, len(values)) :]
+    return sum(tail) / max(1, len(tail))
+
+
+def _parse_quality_gates(parse_log: Dict[str, List[int]], fallback_log: Dict[str, List[int]]) -> Dict[str, float]:
+    return {
+        "parse_aman": _tail_rate(parse_log.get("AMAN", []), 128),
+        "parse_dman": _tail_rate(parse_log.get("DMAN", []), 128),
+        "fallback_aman": _tail_rate(fallback_log.get("AMAN", []), 128),
+        "fallback_dman": _tail_rate(fallback_log.get("DMAN", []), 128),
+    }
+
+
 # ── Unified reward dispatcher ─────────────────────────────────────────────────
 
 def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
@@ -483,20 +557,26 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     TRL GRPOTrainer calls this with a batch of completions.
     kwargs contains per-sample metadata from the dataset.
     """
-    roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
-    if not isinstance(roles, list):
-        roles = [roles] * len(completions)
-    elif len(roles) < len(completions):
-        roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (
-            len(completions) - len(roles)
+    target_len = len(completions)
+    normalized_kwargs: Dict[str, List[Any]] = {}
+    for key, value in kwargs.items():
+        normalized_kwargs[key] = _expand_to_completion_length(
+            value,
+            target_len,
+            field_name=key,
+            num_generations=N_GENERATIONS,
         )
+
+    roles = normalized_kwargs.get("agent_role", [AgentRole.AMAN.value] * target_len)
+    if not roles:
+        roles = [AgentRole.AMAN.value] * target_len
 
     rewards: List[float] = []
     failure_mode = _reward_failure_mode()
 
     for i, (completion, role) in enumerate(zip(completions, roles)):
         fn = REWARD_FN_DISPATCH.get(role, aman_reward_fn)
-        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in kwargs.items()}
+        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in normalized_kwargs.items()}
         try:
             r = fn([completion], **sample_kwargs)
             if not r:
@@ -520,6 +600,7 @@ def train(
     n_episodes:   int  = 200,
     lora_rank:    int  = LORA_RANK,
     seed:         int  = 42,
+    eval_episodes: int = EVAL_EPISODES,
     push_to_hub:  bool = False,
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
@@ -544,6 +625,7 @@ def train(
     print(f"  ATC Multi-Agent GRPO Training")
     print(f"  Model:        {model_name}")
     print(f"  Episodes:     {n_episodes}")
+    print(f"  Eval eps:     {eval_episodes}")
     print(f"  Generations:  {num_generations} per prompt")
     print(f"  Output:       {output_dir}")
     device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -598,7 +680,7 @@ def train(
         print("\n[1.5/5] Measuring base model score (untrained LoRA)...")
         model.eval()
         base_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="BASE MODEL (no fine-tune)"
+            model, tokenizer, n_episodes=eval_episodes, tag="BASE MODEL (no fine-tune)"
         )
         model.train()
         _save_json(base_model_metrics, Path(output_dir) / "base_model_metrics.json")
@@ -626,10 +708,18 @@ def train(
 
     try:
         from datasets import Dataset
-        dataset = Dataset.from_list(dataset_raw)
+        stage_slices = _build_curriculum_slices(dataset_raw, seed=seed)
+        stage_datasets = {
+            name: Dataset.from_list(rows) for name, rows in stage_slices.items() if rows
+        }
     except ImportError:
         print("[ERROR] pip install datasets")
         sys.exit(1)
+    print("    Curriculum:")
+    for stage_name in ("stage_a", "stage_b", "stage_c"):
+        ds = stage_datasets.get(stage_name)
+        if ds is not None:
+            print(f"      {stage_name}: {len(ds)} samples")
 
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
@@ -686,11 +776,23 @@ def train(
     parse_log: Dict[str, List[int]] = {
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
     }
+    fallback_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
+    overflow_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
+    parse_fail_samples: Dict[str, str] = {}
+    parse_fail_counts: Dict[str, int] = {
+        "AMAN": 0, "DMAN": 0, "GENERATOR": 0, "SUPERVISOR": 0
+    }
+    reward_call_count = 0
 
     class RewardLogger:
         __name__ = "combined_reward_fn"
 
         def __call__(self, *args, **kwargs):
+            nonlocal reward_call_count
             # TRL <0.17: reward_func(completions=..., **kwargs)
             # TRL >=0.17: reward_func(prompts, completions, **kwargs)
             if "completions" in kwargs:
@@ -715,6 +817,7 @@ def train(
                 completions = flattened
 
             rewards = combined_reward_fn(completions, **kwargs)
+            reward_call_count += 1
 
             roles = kwargs.get("agent_role", [])
             if not isinstance(roles, list):
@@ -738,17 +841,49 @@ def train(
                     return 0
                 return 0
 
+            def _is_fallback(role: str, parse_ok: int, reward_value: float) -> int:
+                if role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                    return 0 if parse_ok else 1
+                if role == AgentRole.GENERATOR.value:
+                    return 1 if reward_value <= -0.49 else 0
+                if role == AgentRole.SUPERVISOR.value:
+                    return 1 if reward_value <= -0.49 else 0
+                return 0
+
+            def _overflow(role: str, completion: Any) -> int:
+                budget = ROLE_MAX_NEW_TOKENS.get(role, max_new_tokens)
+                approx_tokens = len(str(completion).split())
+                return 1 if approx_tokens > budget else 0
+
             for completion, r, role in zip(completions, rewards, roles):
+                parse_ok = _is_parse_ok(role, completion)
                 if role in reward_log:
                     reward_log[role].append(r)
                 if role in parse_log:
-                    parse_log[role].append(_is_parse_ok(role, completion))
+                    parse_log[role].append(parse_ok)
+                if role in fallback_log:
+                    fallback_log[role].append(_is_fallback(role, parse_ok, float(r)))
+                if role in overflow_log:
+                    overflow_log[role].append(_overflow(role, completion))
+                if role in parse_fail_counts and parse_ok == 0:
+                    parse_fail_counts[role] += 1
+                    if role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                        txt = re.sub(r"\s+", " ", str(completion)).strip()
+                        parse_fail_samples[role] = txt[:220]
                 reward_log["composite"].append(r)
 
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
             if len(reward_log["composite"]) % 50 == 0 and len(reward_log["composite"]) > 50:
                 _check_reward_hacking(reward_log)
+            if reward_call_count % 25 == 0:
+                for role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                    sample = parse_fail_samples.get(role)
+                    if sample:
+                        print(
+                            f"[PARSE_FAIL_SAMPLE] role={role} count={parse_fail_counts[role]} "
+                            f"sample='{sample}'"
+                        )
 
             return rewards
 
@@ -760,7 +895,7 @@ def train(
         "model":            model,
         "processing_class": tokenizer,
         "reward_funcs":     [reward_logger],
-        "train_dataset":    dataset,
+        "train_dataset":    stage_datasets.get("stage_a"),
     }
     if _trainer_supports("args", GRPOTrainer):
         trainer_kwargs["args"] = grpo_config
@@ -798,6 +933,13 @@ def train(
                 tail = vals[-min(window, len(vals)) :]
                 return sum(tail) / max(1, len(tail))
 
+            def _tail_rate(store: Dict[str, List[int]], role: str, window: int = 64) -> float:
+                vals = store.get(role, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
+
             comp = _avg_last("composite")
             aman = _avg_last("AMAN")
             dman = _avg_last("DMAN")
@@ -805,6 +947,12 @@ def train(
             sup = _avg_last("SUPERVISOR")
             p_aman = _parse_rate("AMAN")
             p_dman = _parse_rate("DMAN")
+            p_gen = _parse_rate("GENERATOR")
+            p_sup = _parse_rate("SUPERVISOR")
+            f_aman = _tail_rate(fallback_log, "AMAN")
+            f_dman = _tail_rate(fallback_log, "DMAN")
+            o_aman = _tail_rate(overflow_log, "AMAN")
+            o_dman = _tail_rate(overflow_log, "DMAN")
             print(
                 "[LIVE] "
                 f"step={step}/{max_steps} "
@@ -812,7 +960,9 @@ def train(
                 f"lr={lr if lr is not None else 'n/a'} "
                 f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
                 f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
-                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)}]"
+                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)} G={_fmt(p_gen)} S={_fmt(p_sup)}] "
+                f"fb64[A={_fmt(f_aman)} D={_fmt(f_dman)}] "
+                f"ovf64[A={_fmt(o_aman)} D={_fmt(o_dman)}]"
             )
 
     if hasattr(trainer, "add_callback"):
@@ -858,9 +1008,97 @@ def train(
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
             print(f"[INFO] Deleted stale compiled cache: {cache_dir}")
-    
-    # Now train with fresh cache
-    trainer.train()
+
+    strict_gates = os.getenv("ATC_STRICT_GATES", "1").strip().lower() in {"1", "true", "yes", "on"}
+    stage_sequence = ["stage_a", "stage_b", "stage_c"]
+    stage_a_retries = 0
+
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _optimization_gates() -> Dict[str, float]:
+        history = list(getattr(getattr(trainer, "state", None), "log_history", []) or [])
+        reward_std_vals = [
+            _safe_float(entry.get("reward_std"), 0.0)
+            for entry in history
+            if "reward_std" in entry
+        ]
+        clip_vals = [
+            _safe_float(entry.get("clip_ratio/region_mean"), 0.0)
+            for entry in history
+            if "clip_ratio/region_mean" in entry
+        ]
+        clip_nonzero_frac = (
+            sum(1 for v in clip_vals if v > 1e-8) / max(1, len(clip_vals))
+            if clip_vals else 0.0
+        )
+        reward_std_med = (
+            sorted(reward_std_vals)[len(reward_std_vals) // 2]
+            if reward_std_vals else 0.0
+        )
+        return {"clip_nonzero_frac": clip_nonzero_frac, "reward_std_median": reward_std_med}
+
+    for stage_name in stage_sequence:
+        ds = stage_datasets.get(stage_name)
+        if ds is None or len(ds) == 0:
+            continue
+        if hasattr(trainer, "train_dataset"):
+            trainer.train_dataset = ds
+        if hasattr(trainer, "_train_dataloader"):
+            trainer._train_dataloader = None
+        if hasattr(trainer, "args"):
+            trainer.args.num_train_epochs = STAGE_EPOCHS.get(stage_name, 0.25)
+        print(
+            f"\n[STAGE] {stage_name} samples={len(ds)} "
+            f"epochs={getattr(getattr(trainer, 'args', None), 'num_train_epochs', 'n/a')}"
+        )
+        trainer.train()
+
+        parse_gates = _parse_quality_gates(parse_log, fallback_log)
+        opt_gates = _optimization_gates()
+        print(
+            f"[GATE] {stage_name} "
+            f"parseA={parse_gates['parse_aman']:.3f} parseD={parse_gates['parse_dman']:.3f} "
+            f"fbA={parse_gates['fallback_aman']:.3f} fbD={parse_gates['fallback_dman']:.3f} "
+            f"clipNonZero={opt_gates['clip_nonzero_frac']:.3f} "
+            f"rewardStdMed={opt_gates['reward_std_median']:.4f}"
+        )
+
+        if stage_name == "stage_a":
+            parse_ok = (
+                parse_gates["parse_aman"] >= 0.85
+                and parse_gates["parse_dman"] >= 0.85
+            )
+            if not parse_ok and stage_a_retries < 1:
+                stage_a_retries += 1
+                if hasattr(trainer, "args"):
+                    trainer.args.num_train_epochs = 0.20
+                print("[GATE] Stage A parse gate missed; running one extra controller-only pass.")
+                trainer.train()
+                parse_gates = _parse_quality_gates(parse_log, fallback_log)
+                print(
+                    f"[GATE] stage_a_retry parseA={parse_gates['parse_aman']:.3f} "
+                    f"parseD={parse_gates['parse_dman']:.3f}"
+                )
+            if strict_gates and not (
+                parse_gates["parse_aman"] >= 0.75 and parse_gates["parse_dman"] >= 0.75
+            ):
+                raise RuntimeError(
+                    "Parse gate failed after Stage A: "
+                    f"AMAN={parse_gates['parse_aman']:.3f}, DMAN={parse_gates['parse_dman']:.3f}"
+                )
+        if strict_gates and (
+            opt_gates["clip_nonzero_frac"] < 0.20
+            or opt_gates["reward_std_median"] < 0.02
+        ):
+            raise RuntimeError(
+                f"Optimization gate failed in {stage_name}: "
+                f"clip_nonzero_frac={opt_gates['clip_nonzero_frac']:.3f}, "
+                f"reward_std_median={opt_gates['reward_std_median']:.4f}"
+            )
 
     # ── Save ──────────────────────────────────────────────────────────────────
     print(f"\nSaving model to {output_dir}...")
@@ -878,12 +1116,30 @@ def train(
         print("\n[Post] Measuring trained model score...")
         FastLanguageModel.for_inference(model)  # fuse LoRA weights for faster generation
         trained_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="TRAINED MODEL"
+            model, tokenizer, n_episodes=eval_episodes, tag="TRAINED MODEL"
         )
         _save_json(trained_model_metrics, Path(output_dir) / "trained_model_metrics.json")
 
         if base_model_metrics is not None:
             _print_improvement(base_model_metrics, trained_model_metrics)
+            delta_comp = float(trained_model_metrics.get("mean_composite", 0.0)) - float(
+                base_model_metrics.get("mean_composite", 0.0)
+            )
+            delta_aman = float(trained_model_metrics.get("mean_aman_reward", 0.0)) - float(
+                base_model_metrics.get("mean_aman_reward", 0.0)
+            )
+            delta_dman = float(trained_model_metrics.get("mean_dman_reward", 0.0)) - float(
+                base_model_metrics.get("mean_dman_reward", 0.0)
+            )
+            print(
+                f"[GATE] quality delta_comp={delta_comp:+.3f} "
+                f"delta_aman={delta_aman:+.3f} delta_dman={delta_dman:+.3f}"
+            )
+            if strict_gates and not (delta_comp >= 0.0 and (delta_aman > 0.0 or delta_dman > 0.0)):
+                raise RuntimeError(
+                    "Quality gate failed: expected non-negative composite delta and at least one "
+                    "controller reward improvement."
+                )
         else:
             # Fallback: compare heuristic baseline vs trained model
             _print_improvement(
@@ -1281,6 +1537,7 @@ def main() -> None:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--temperature",    type=float, default=None)
     parser.add_argument("--logging_steps",  type=int, default=None)
+    parser.add_argument("--eval_episodes",  type=int, default=EVAL_EPISODES)
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
     parser.add_argument("--eval_only",      action="store_true")
@@ -1317,6 +1574,7 @@ def main() -> None:
             n_episodes=args.episodes,
             lora_rank=args.lora_rank,
             seed=args.seed,
+            eval_episodes=max(3, args.eval_episodes),
             push_to_hub=args.push_to_hub,
             hub_model_id=args.hub_model_id,
             run_eval=not args.no_eval,
