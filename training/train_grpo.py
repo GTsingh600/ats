@@ -75,6 +75,10 @@ def _require_training_deps():
     return torch, FastLanguageModel, GRPOConfig, GRPOTrainer
 
 
+from training.continuous_curriculum import (
+    load_or_create_continuous_state,
+    save_continuous_state,
+)
 from training.dataset import (
     build_episode_dataset,
     parse_aman_action,
@@ -734,78 +738,141 @@ def train(
               f"  (AMAN {base_model_metrics['mean_aman_reward']:.3f}"
               f" / DMAN {base_model_metrics['mean_dman_reward']:.3f})")
 
-    # ── 3. Build training dataset ─────────────────────────────────────────────
-    print(f"\n[2/5] Building {n_episodes}-episode multi-agent dataset...")
+    # ── 3. Build training dataset (static list OR live iterable for grounded) ─
+    print(f"\n[2/5] Building training data...")
     t0 = time.time()
-    dataset_raw = build_episode_dataset(
-        n_episodes=n_episodes,
-        seed=seed,
-        include_generator=not use_grounded_curriculum,
-        include_supervisor=True,
-        include_adapt=not use_grounded_curriculum,
-        domain_episode_ratio=0.30,
-        use_grounded_curriculum=use_grounded_curriculum,
-        curriculum_state_path=curriculum_state_path,
+    continuous_path = Path(output_dir) / "continuous_curriculum_state.json"
+    curriculum_manager = None
+    grounded_live = (
+        use_grounded_curriculum
+        and os.environ.get("ATC_STATIC_GROUNDED_DATASET", "").lower() not in {"1", "true", "yes"}
     )
-    print(f"    Dataset (pre-split): {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+    from training.live_curriculum import live_max_steps as _live_max_steps
 
-    dataset_train = [
-        s for s in dataset_raw
-        if s.get("task_id") == "domain_transfer" or s.get("task_id") not in holdout_task_ids
-    ]
-    dataset_val = [
-        s for s in dataset_raw
-        if s.get("task_id") in holdout_task_ids
-    ]
-    print(f"    Train samples: {len(dataset_train)} | Holdout samples: {len(dataset_val)}")
+    computed_max_steps = _live_max_steps(n_episodes, batch_size, grad_accum)
 
-    if use_grounded_curriculum:
-        band_counts: Dict[str, int] = {}
-        level_counts: Dict[int, int] = {}
+    if grounded_live:
+        if curriculum_state_path:
+            _src = Path(curriculum_state_path)
+            if _src.is_file():
+                continuous_path.parent.mkdir(parents=True, exist_ok=True)
+                continuous_path.write_bytes(_src.read_bytes())
+                print(f"    Warm-start live curriculum from {_src}")
+
+        from training.live_curriculum import CurriculumManager
+
+        curriculum_manager = CurriculumManager(
+            seed=seed,
+            output_dir=Path(output_dir),
+            continuous_state_path=continuous_path,
+        )
+        from torch.utils.data import IterableDataset
+        from training.live_curriculum import iter_live_grounded_rows
+
+        class _LiveTorchIterable(IterableDataset):  # type: ignore[misc]
+            def __init__(self, mgr, sd: int):
+                super().__init__()
+                self._mgr = mgr
+                self._sd = int(sd)
+
+            def __iter__(self):
+                return iter_live_grounded_rows(self._mgr, self._sd)
+
+        dataset = _LiveTorchIterable(curriculum_manager, seed)
+        dataset_train: List[Dict[str, Any]] = []
+        dataset_val: List[Dict[str, Any]] = []
+        print(
+            f"    Live grounded iterable (max_steps={computed_max_steps}, "
+            f"virtual_episodes≈{n_episodes}) — init {time.time()-t0:.1f}s"
+        )
+        _save_json(
+            {"mode": "live_iterable", "max_steps": computed_max_steps, "virtual_episodes": n_episodes},
+            Path(output_dir) / "grounded_dataset_summary.json",
+        )
+    else:
+        dataset_raw = build_episode_dataset(
+            n_episodes=n_episodes,
+            seed=seed,
+            include_generator=not use_grounded_curriculum,
+            include_supervisor=True,
+            include_adapt=not use_grounded_curriculum,
+            domain_episode_ratio=0.30,
+            use_grounded_curriculum=use_grounded_curriculum,
+            curriculum_state_path=curriculum_state_path,
+            continuous_curriculum_path=str(continuous_path),
+        )
+        print(f"    Dataset (pre-split): {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+
+        dataset_train = [
+            s for s in dataset_raw
+            if s.get("task_id") == "domain_transfer" or s.get("task_id") not in holdout_task_ids
+        ]
+        dataset_val = [
+            s for s in dataset_raw
+            if s.get("task_id") in holdout_task_ids
+        ]
+        print(f"    Train samples: {len(dataset_train)} | Holdout samples: {len(dataset_val)}")
+
+        if use_grounded_curriculum:
+            bucket_counts: Dict[int, int] = {}
+            template_counts: Dict[str, int] = {}
+            d_vals: List[float] = []
+            for s in dataset_train:
+                if not s.get("grounded_curriculum"):
+                    continue
+                bidx = int(s.get("difficulty_bucket_index", -1))
+                if bidx >= 0:
+                    bucket_counts[bidx] = bucket_counts.get(bidx, 0) + 1
+                tid = s.get("grounded_template_id")
+                if isinstance(tid, str):
+                    template_counts[tid] = template_counts.get(tid, 0) + 1
+                cd = s.get("continuous_difficulty")
+                if isinstance(cd, (int, float)):
+                    d_vals.append(float(cd))
+            grounded_summary = {
+                "mode": "static_list",
+                "difficulty_bucket_counts": {str(k): v for k, v in sorted(bucket_counts.items())},
+                "grounded_template_counts": dict(sorted(template_counts.items())),
+                "continuous_d_mean": round(sum(d_vals) / len(d_vals), 4) if d_vals else None,
+                "continuous_d_min": round(min(d_vals), 4) if d_vals else None,
+                "continuous_d_max": round(max(d_vals), 4) if d_vals else None,
+            }
+            _save_json(grounded_summary, Path(output_dir) / "grounded_dataset_summary.json")
+            print(f"    Grounded dataset summary: {grounded_summary}")
+
+        role_counts: Dict[str, int] = {}
         for s in dataset_train:
-            if not s.get("grounded_curriculum"):
+            r = s.get("agent_role", "unknown")
+            role_counts[r] = role_counts.get(r, 0) + 1
+        for role, count in sorted(role_counts.items()):
+            print(f"    {role}: {count} samples")
+
+        mut_types: List[str] = []
+        for s in dataset_train:
+            if s.get("agent_role") != AgentRole.GENERATOR.value:
                 continue
-            b = s.get("training_band", "unknown")
-            band_counts[b] = band_counts.get(b, 0) + 1
-            lev = int(s.get("grounded_level", -1))
-            if lev >= 0:
-                level_counts[lev] = level_counts.get(lev, 0) + 1
-        grounded_summary = {
-            "training_band_counts": band_counts,
-            "grounded_level_counts": {str(k): v for k, v in sorted(level_counts.items())},
-        }
-        _save_json(grounded_summary, Path(output_dir) / "grounded_dataset_summary.json")
-        print(f"    Grounded dataset summary: {grounded_summary}")
+            text = " ".join(m.get("content", "") for m in s.get("prompt", []))
+            for m in re.findall(
+                r"(tighten_window|inject_emergency|increase_weather_penalty|add_atfm_deadline|close_runway_window|add_conflicting_flight)",
+                text,
+            ):
+                mut_types.append(m)
+        print(f"    Generator mutation entropy: {_shannon_entropy(mut_types):.3f} bits")
 
-    role_counts: Dict[str, int] = {}
-    for s in dataset_train:
-        r = s.get("agent_role", "unknown")
-        role_counts[r] = role_counts.get(r, 0) + 1
-    for role, count in sorted(role_counts.items()):
-        print(f"    {role}: {count} samples")
+        try:
+            from datasets import Dataset
 
-    mut_types: List[str] = []
-    for s in dataset_train:
-        if s.get("agent_role") != AgentRole.GENERATOR.value:
-            continue
-        text = " ".join(m.get("content", "") for m in s.get("prompt", []))
-        for m in re.findall(
-            r"(tighten_window|inject_emergency|increase_weather_penalty|add_atfm_deadline|close_runway_window|add_conflicting_flight)",
-            text,
-        ):
-            mut_types.append(m)
-    print(f"    Generator mutation entropy: {_shannon_entropy(mut_types):.3f} bits")
-
-    try:
-        from datasets import Dataset
-        dataset = Dataset.from_list(dataset_train)
-    except ImportError:
-        print("[ERROR] pip install datasets")
-        sys.exit(1)
+            dataset = Dataset.from_list(dataset_train)
+        except ImportError:
+            print("[ERROR] pip install datasets")
+            sys.exit(1)
 
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
-    est_steps = max(1, len(dataset_train) // max(1, batch_size))
+    if curriculum_manager is not None:
+        est_steps = max(1, computed_max_steps // max(1, batch_size))
+    else:
+        est_steps = max(1, len(dataset_train) // max(1, batch_size))
     warmup_steps = max(1, int(round(est_steps * WARMUP_STEPS_FRACTION)))
     print(
         f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, kl={kl_coeff}, "
@@ -817,7 +884,6 @@ def train(
         "learning_rate":                LR,
         "per_device_train_batch_size":  batch_size,
         "gradient_accumulation_steps":  grad_accum,
-        "num_train_epochs":             1,
         "lr_scheduler_type":            "cosine",
         "logging_steps":                LOGGING_STEPS,
         "save_steps":                   SAVE_STEPS,
@@ -829,6 +895,10 @@ def train(
         "gradient_checkpointing":       True,
         "optim":                        "paged_adamw_8bit",
     }
+    if curriculum_manager is not None:
+        grpo_kwargs["max_steps"] = int(computed_max_steps)
+    else:
+        grpo_kwargs["num_train_epochs"] = 1
 
     if _wandb_available():
         grpo_kwargs["report_to"] = "wandb"
@@ -874,6 +944,12 @@ def train(
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": []
     }
     difficulty_log: List[float] = []
+    cc_runtime = None
+    if curriculum_manager is None:
+        cc_runtime = load_or_create_continuous_state(
+            continuous_path if continuous_path.is_file() else None
+        )
+    cc_log_path = Path(output_dir) / "continuous_curriculum_log.jsonl"
 
     def _safe_mean(vals: List[float]) -> float:
         if not vals:
@@ -1056,6 +1132,40 @@ def train(
                     )
             batch_diagnostics.append(batch_summary)
 
+            if rewards and (curriculum_manager is not None or (use_grounded_curriculum and cc_runtime is not None)):
+                ds_batch: List[float] = []
+                rs_batch: List[float] = []
+                mask_batch: List[bool] = []
+                for idx in range(len(rewards)):
+                    role_i = _select_sample_value(roles, idx)
+                    mask_batch.append(role_i in (AgentRole.AMAN.value, AgentRole.DMAN.value))
+                    try:
+                        raw_di = _select_sample_value(raw_difficulty, idx)
+                        ds_batch.append(max(0.0, min(1.0, float(raw_di))))
+                    except Exception:
+                        ds_batch.append(0.0)
+                    rs_batch.append(float(rewards[idx]))
+                if curriculum_manager is not None:
+                    curriculum_manager.on_reward_batch(ds_batch, rs_batch, list(roles))
+                    st = curriculum_manager.state
+                else:
+                    cc_runtime.record_batch(ds_batch, rs_batch, mask_batch)
+                    st = cc_runtime
+                if st.global_batches % 25 == 0:
+                    save_continuous_state(continuous_path, st)
+                    _rho = st.reward_difficulty_correlation()
+                    row = {
+                        "batch": st.global_batches,
+                        "mu": round(st.mu, 4),
+                        "c": round(st.c, 4),
+                        "bin_success": st.bin_success_snapshot(),
+                        "bin_reward_mean": st.bin_reward_mean_snapshot(),
+                        "rho_rd": None if (_rho != _rho) else round(_rho, 4),
+                    }
+                    cc_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with cc_log_path.open("a", encoding="utf-8") as lf:
+                        lf.write(json.dumps(row) + "\n")
+
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
             if len(reward_log["composite"]) % 50 == 0 and len(reward_log["composite"]) > 50:
@@ -1210,6 +1320,11 @@ def train(
     
     # Now train with fresh cache
     trainer.train()
+
+    if curriculum_manager is not None:
+        curriculum_manager.save()
+    elif use_grounded_curriculum and cc_runtime is not None:
+        save_continuous_state(continuous_path, cc_runtime)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     print(f"\nSaving model to {output_dir}...")
@@ -1665,7 +1780,12 @@ def main() -> None:
     parser.add_argument(
         "--curriculum_state",
         default=None,
-        help="Optional path to grounded_curriculum_state.json from a prior run (warm-start stats).",
+        help="Optional path to continuous_curriculum_state.json from a prior run (copied into output_dir for live; passed to static builder otherwise).",
+    )
+    parser.add_argument(
+        "--static_grounded_dataset",
+        action="store_true",
+        help="With --grounded_curriculum, use a fixed pre-built dataset (disables live iterable resampling).",
     )
     args = parser.parse_args()
 
@@ -1692,6 +1812,8 @@ def main() -> None:
     if args.eval_only:
         evaluate(args.model, n_episodes=max(1, int(args.eval_episodes)), seed=args.seed)
     else:
+        if args.static_grounded_dataset:
+            os.environ["ATC_STATIC_GROUNDED_DATASET"] = "1"
         train(
             model_name=args.model,
             output_dir=args.output_dir,

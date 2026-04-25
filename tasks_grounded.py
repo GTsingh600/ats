@@ -287,6 +287,178 @@ GC_L5_CAPACITY_STRESS = TaskDefinition(
     ],
 )
 
+# --- Expanded canonical bank (unique structure; validated by rule solver at import) ---
+GC_G6_SEGREGATED_BUSY = TaskDefinition(
+    task_id="gc_g6_segregated_busy",
+    title="Grounded G6 — Segregated parallel runways, five movements",
+    difficulty=Difficulty.MEDIUM,
+    airport="TOY2",
+    description=(
+        "Three arrivals on 09L plus two departures on 09R — segregated parallel ops "
+        "(FAA-style simplified), higher movement count than L1."
+    ),
+    objective="Sequence arrivals on 09L and departures on 09R with wake spacing.",
+    grading_focus=["Wake spacing on 09L", "Parallel runway throughput"],
+    planning_horizon_minutes=55,
+    max_steps=4,
+    delay_budget=130,
+    fuel_budget=520.0,
+    fairness_tolerance=18.0,
+    runways=[
+        RunwaySpec(
+            runway_id="09L",
+            allowed_operations=[OperationType.ARRIVAL],
+            hourly_capacity=26,
+            weather_penalty=1.0,
+            notes="Arrival-only.",
+        ),
+        RunwaySpec(
+            runway_id="09R",
+            allowed_operations=[OperationType.DEPARTURE],
+            hourly_capacity=26,
+            weather_penalty=1.0,
+            notes="Departure-only.",
+        ),
+    ],
+    flights=[
+        _f("GC6_A1", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 10, 8, 24, ["09L"], 80, 2.0),
+        _f("GC6_A2", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 16, 14, 30, ["09L"], 78, 2.0),
+        _f("GC6_A3", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 22, 20, 36, ["09L"], 76, 2.0),
+        _f("GC6_D1", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 18, 14, 32, ["09R"], 90, 2.0),
+        _f("GC6_D2", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 28, 24, 40, ["09R"], 88, 2.0),
+    ],
+)
+
+GC_G7_WAKE_ASYM = TaskDefinition(
+    task_id="gc_g7_wake_asym_mixed",
+    title="Grounded G7 — Heavy/Light wake asymmetry on mixed runway",
+    difficulty=Difficulty.MEDIUM,
+    airport="TOY3",
+    description=(
+        "Single mixed runway with Heavy arrival and Light departure — exploits H→L "
+        "six-minute spacing rule vs lighter reverse pairs."
+    ),
+    objective="Order Heavy/Light correctly on one runway under overlapping windows.",
+    grading_focus=["Wake asymmetry", "Mixed runway"],
+    planning_horizon_minutes=60,
+    max_steps=4,
+    delay_budget=110,
+    fuel_budget=500.0,
+    fairness_tolerance=16.0,
+    runways=[
+        RunwaySpec(
+            runway_id="09C",
+            allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+            hourly_capacity=24,
+            weather_penalty=1.0,
+            notes="Mixed-use.",
+        ),
+    ],
+    flights=[
+        _f("GC7_H1", "GC", OperationType.ARRIVAL, WakeClass.HEAVY, 14, 10, 26, ["09C"], 220, 3.5),
+        _f("GC7_L1", "GC", OperationType.DEPARTURE, WakeClass.LIGHT, 16, 12, 30, ["09C"], 40, 1.2),
+    ],
+)
+
+GC_G8_FOUR_MIXED = TaskDefinition(
+    task_id="gc_g8_four_mixed_bank",
+    title="Grounded G8 — Four-flight mixed bank",
+    difficulty=Difficulty.MEDIUM,
+    airport="TOY1",
+    description="Four movements on one mixed runway — denser coordination than L3.",
+    objective="Conflict-free sequencing for four flights on 09C.",
+    grading_focus=["Density", "Wake"],
+    planning_horizon_minutes=65,
+    max_steps=4,
+    delay_budget=125,
+    fuel_budget=560.0,
+    fairness_tolerance=15.0,
+    runways=[
+        RunwaySpec(
+            runway_id="09C",
+            allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+            hourly_capacity=20,
+            weather_penalty=1.0,
+            notes="Mixed-use.",
+        ),
+    ],
+    flights=[
+        _f("GC8_A1", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 10, 6, 22, ["09C"], 70, 2.0),
+        _f("GC8_D1", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 12, 8, 24, ["09C"], 85, 2.0),
+        _f("GC8_A2", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 18, 14, 32, ["09C"], 72, 2.0),
+        _f("GC8_D2", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 20, 16, 36, ["09C"], 86, 2.0),
+    ],
+)
+
+GC_G9_TRIPLE_MIXED = TaskDefinition(
+    task_id="gc_g9_triple_tight_mixed",
+    title="Grounded G9 — Tight three-flight mixed overlap",
+    difficulty=Difficulty.EASY,
+    airport="TOY1",
+    description="Three flights, mixed runway, tighter windows than L2.",
+    objective="Find feasible order on 09C.",
+    grading_focus=["Overlap", "Sequencing"],
+    planning_horizon_minutes=50,
+    max_steps=4,
+    delay_budget=95,
+    fuel_budget=430.0,
+    fairness_tolerance=17.0,
+    runways=[
+        RunwaySpec(
+            runway_id="09C",
+            allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+            hourly_capacity=24,
+            weather_penalty=1.05,
+            notes="Mixed-use.",
+        ),
+    ],
+    flights=[
+        _f("GC9_A1", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 13, 9, 22, ["09C"], 68, 2.0),
+        _f("GC9_D1", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 14, 10, 24, ["09C"], 82, 2.0),
+        _f("GC9_D2", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 19, 15, 30, ["09C"], 84, 2.0),
+    ],
+)
+
+GC_G10_DUAL_MIXED = TaskDefinition(
+    task_id="gc_g10_dual_mixed_runways",
+    title="Grounded G10 — Two mixed runways, cross-runway structure",
+    difficulty=Difficulty.MEDIUM,
+    airport="TOY4",
+    description=(
+        "Two independent mixed runways (09C and 08) — adds runway graph dimension; "
+        "each flight restricted to one side (no cross-assignment)."
+    ),
+    objective="Schedule two pairs on parallel mixed runways without conflicts.",
+    grading_focus=["Parallel mixed ops", "Completeness"],
+    planning_horizon_minutes=55,
+    max_steps=4,
+    delay_budget=120,
+    fuel_budget=510.0,
+    fairness_tolerance=17.0,
+    runways=[
+        RunwaySpec(
+            runway_id="09C",
+            allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+            hourly_capacity=22,
+            weather_penalty=1.0,
+            notes="Mixed bank A.",
+        ),
+        RunwaySpec(
+            runway_id="08",
+            allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+            hourly_capacity=22,
+            weather_penalty=1.0,
+            notes="Mixed bank B.",
+        ),
+    ],
+    flights=[
+        _f("G10_A1", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 12, 8, 24, ["09C"], 70, 2.0),
+        _f("G10_D1", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 16, 12, 28, ["09C"], 82, 2.0),
+        _f("G10_A2", "GC", OperationType.ARRIVAL, WakeClass.MEDIUM, 14, 10, 26, ["08"], 68, 2.0),
+        _f("G10_D2", "GC", OperationType.DEPARTURE, WakeClass.MEDIUM, 18, 14, 30, ["08"], 84, 2.0),
+    ],
+)
+
 
 GROUNDED_CURRICULUM_TASKS: List[TaskDefinition] = [
     GC_L0_ISOLATED,
@@ -295,6 +467,17 @@ GROUNDED_CURRICULUM_TASKS: List[TaskDefinition] = [
     GC_L3_OVERLAP_BANK,
     GC_L4_TIMING_UNCERTAINTY,
     GC_L5_CAPACITY_STRESS,
+    GC_G6_SEGREGATED_BUSY,
+    GC_G7_WAKE_ASYM,
+    GC_G8_FOUR_MIXED,
+    GC_G9_TRIPLE_MIXED,
+    GC_G10_DUAL_MIXED,
 ]
 
 GROUNDED_LEVEL_BY_TASK_ID = {t.task_id: idx for idx, t in enumerate(GROUNDED_CURRICULUM_TASKS)}
+
+# Continuous curriculum anchors in (0, 1): nearest-d template selection (not a hard discrete level).
+_N = len(GROUNDED_CURRICULUM_TASKS)
+GROUNDED_TASK_DIFFICULTY_ANCHOR = {
+    t.task_id: (i + 1.0) / (_N + 1.0) for i, t in enumerate(GROUNDED_CURRICULUM_TASKS)
+}

@@ -283,7 +283,7 @@ def aman_reward_fn(
 
         cross_penalty = 0.0
         if {s.runway for s in aman_action.arrival_slots} & {s.runway for s in dman_slots}:
-            cross_penalty = _normalized_cross_conflict_penalty(
+            cross_penalty = 1.55 * _normalized_cross_conflict_penalty(
                 aman_action.arrival_slots,
                 dman_slots,
                 outcome.metrics.conflict_count,
@@ -327,9 +327,12 @@ def aman_reward_fn(
             ]
         ) - cross_penalty - _length_budget_penalty("AMAN", completion)
 
+        if outcome.metrics.conflict_count == 0 and coverage >= 0.95 and missing == 0:
+            reward = min(1.0, reward + 0.12)
+
         # Layered safety gates — hard ceilings that cannot be bought off by efficiency
         if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
+            reward = min(reward, 0.18)   # conflict-free gate (stronger penalty)
         if emg_miss > 0:
             reward = min(reward, 0.40)   # emergency hard gate
         if coverage < 0.50:
@@ -450,7 +453,7 @@ def dman_reward_fn(
 
         cross_penalty = 0.0
         if {s.runway for s in dman_action.departure_slots} & {s.runway for s in aman_slots}:
-            cross_penalty = _normalized_cross_conflict_penalty(
+            cross_penalty = 1.55 * _normalized_cross_conflict_penalty(
                 dman_action.departure_slots,
                 aman_slots,
                 outcome.metrics.conflict_count,
@@ -495,9 +498,12 @@ def dman_reward_fn(
             ]
         ) - cross_penalty - _length_budget_penalty("DMAN", completion)
 
+        if outcome.metrics.conflict_count == 0 and coverage >= 0.95 and missing == 0:
+            reward = min(1.0, reward + 0.12)
+
         # Layered safety gates
         if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
+            reward = min(reward, 0.18)   # conflict-free gate (stronger penalty)
         if emg_miss > 0:
             reward = min(reward, 0.40)   # emergency hard gate
         if coverage < 0.50:

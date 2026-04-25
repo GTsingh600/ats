@@ -27,10 +27,19 @@ from engine import simulate_plan
 from models import OperationType, SlotAssignment, TaskDefinition
 from tasks import ordered_tasks
 from tasks_grounded import GROUNDED_LEVEL_BY_TASK_ID
+from training.continuous_curriculum import (
+    apply_meaningful_structural_variation,
+    balanced_d_sequence,
+    bucket_index,
+    difficulty_proxy_task,
+    load_or_create_continuous_state,
+    scenario_features,
+    softmax_pick_grounded_task,
+    validate_bucket_balance,
+)
 from training.curriculum_grounded import (
     GroundedCurriculumState,
     grounded_task_proxy_score,
-    pick_grounded_task,
     solve_grounded_rule_based,
 )
 from multi_agent.environment import MultiAgentATCEnvironment
@@ -214,6 +223,9 @@ def build_episode_dataset(
     domain_episode_ratio: float = 0.30,
     use_grounded_curriculum: bool = False,
     curriculum_state_path: Optional[str] = None,
+    continuous_curriculum_path: Optional[str] = None,
+    grounded_balanced_buckets: bool = True,
+    require_bucket_balance: bool = True,
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
 
@@ -223,10 +235,13 @@ def build_episode_dataset(
     If include_supervisor: also 1 supervisor turn per episode.
 
     When ``use_grounded_curriculum`` is True, episodes use deterministic canonical
-    tasks (no ChallengeGenerator mutations, no env parametric randomization). Level
-    sampling follows ``pick_grounded_task`` with optional warm-start state from
-    ``curriculum_state_path``. Samples include ``grounded_level``, ``training_band``,
-    and ``curriculum_active_level`` for logging.
+    templates (no ChallengeGenerator mutations, no env parametric randomization).
+    Difficulty is a continuous scalar ``d`` in ``[0, 1]`` (``continuous_difficulty`` /
+    ``difficulty_scalar``). Initial builds use equal mass per quartile bucket via
+    ``balanced_d_sequence`` unless ``continuous_curriculum_state.json`` requests
+    adaptive Beta sampling. Templates are chosen with ``nearest_grounded_task(d)``;
+    optional timing offsets are solver-gated. Discrete ``difficulty_bucket_index``
+    and ``grounded_level`` appear only for logging.
     """
     import random
     rng = random.Random(seed)
@@ -236,6 +251,8 @@ def build_episode_dataset(
     generator = ChallengeGenerator(seed=seed)
 
     grounded_state: Optional[GroundedCurriculumState] = None
+    cc_state = None
+    d_sequence: List[float] = []
     if use_grounded_curriculum:
         if curriculum_state_path:
             from pathlib import Path
@@ -246,6 +263,17 @@ def build_episode_dataset(
         if grounded_state is None:
             grounded_state = GroundedCurriculumState()
         include_generator = False
+
+        from pathlib import Path as _Path
+
+        cc_path = _Path(continuous_curriculum_path) if continuous_curriculum_path else None
+        cc_state = load_or_create_continuous_state(cc_path)
+        if grounded_balanced_buckets and not cc_state.use_adaptive_sampling:
+            if require_bucket_balance:
+                validate_bucket_balance(n_episodes)
+            d_sequence = balanced_d_sequence(n_episodes, rng)
+        else:
+            d_sequence = [cc_state.sample_d(rng) for _ in range(n_episodes)]
 
     samples: List[Dict[str, Any]] = []
 
@@ -265,22 +293,27 @@ def build_episode_dataset(
     for ep_id in range(n_episodes):
         if use_grounded_curriculum:
             assert grounded_state is not None
-            base_task = pick_grounded_task(rng, ep_id, grounded_state)
-            mutated_task = base_task
+            assert cc_state is not None and d_sequence
+            d = float(d_sequence[ep_id])
+            base_task = softmax_pick_grounded_task(d, rng, k=4, temperature=7.0)
+            mutated_task = apply_meaningful_structural_variation(base_task, d, rng)
             mutation_types = []
             task_level = int(GROUNDED_LEVEL_BY_TASK_ID.get(base_task.task_id, 0))
-            difficulty_scalar = float(task_level) / 5.0
-            difficulty_level = task_level
+            difficulty_scalar = d
+            difficulty_level = 0
             proxy_score = grounded_task_proxy_score(mutated_task)
-            if task_level <= 1:
-                band = "calibration"
-            elif task_level <= 3:
-                band = "learning"
-            else:
-                band = "challenge"
+            d_proxy = float(difficulty_proxy_task(mutated_task))
+            feats = scenario_features(d)
+            bidx = bucket_index(d)
+            band = f"bucket_{bidx}"
             grounded_meta = {
                 "grounded_curriculum": True,
+                "continuous_difficulty": d,
+                "difficulty_proxy": d_proxy,
+                "difficulty_bucket_index": bidx,
+                "scenario_features": feats,
                 "grounded_level": task_level,
+                "grounded_template_id": base_task.task_id,
                 "training_band": band,
                 "curriculum_active_level": grounded_state.active_level,
                 "rule_proxy_score": float(proxy_score),
