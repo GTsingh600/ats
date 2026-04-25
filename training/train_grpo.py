@@ -35,6 +35,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -96,20 +97,64 @@ LORA_RANK      = 16
 LORA_ALPHA     = 32
 LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
 MAX_SEQ_LEN    = 4096
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 256
 TEMPERATURE    = 0.9   # higher temp → more diverse GRPO rollouts → non-zero group std
 # 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
 # With N=2 the group std is near-zero, making the normalised advantage meaningless.
 N_GENERATIONS  = 4
-BATCH_SIZE     = 2
-GRAD_ACCUM     = 4           # effective batch = 8
+BATCH_SIZE     = 4
+GRAD_ACCUM     = 2           # effective batch = 8
 LR             = 5e-5
 # In trl==0.16.0 + unsloth==2026.4.7 with PEFT, non-zero KL can fail when
 # ref_per_token_logps is absent in the fast path (ref=None crash).
 KL_COEFF       = 0.0
 WARMUP_RATIO   = 0.05
+LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
+
+
+def _configure_runtime_warnings() -> None:
+    """Hide repetitive upstream warnings that don't affect correctness."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Both `max_new_tokens` \(=.*\) and `max_length`\(=.*\) seem to have been set\..*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Passing `generation_config` together with generation-related arguments=.* is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*deprecated.*",
+        category=FutureWarning,
+    )
+
+
+def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
+    """Return tuned batch/accum/token settings based on detected VRAM."""
+    tuned = {
+        "batch_size": BATCH_SIZE,
+        "grad_accum": GRAD_ACCUM,
+        "max_new_tokens": MAX_NEW_TOKENS,
+    }
+    if not torch_module.cuda.is_available():
+        return tuned
+    try:
+        vram_gb = torch_module.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return tuned
+
+    # 80GB-class GPUs: increase throughput while keeping rollout quality.
+    if vram_gb >= 70:
+        tuned["batch_size"] = max(tuned["batch_size"], 8)
+        tuned["grad_accum"] = 1
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 256)
+    elif vram_gb >= 40:
+        tuned["batch_size"] = max(tuned["batch_size"], 6)
+        tuned["grad_accum"] = min(tuned["grad_accum"], 2)
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 320)
+    return tuned
 
 
 # ── Role-dispatch table ───────────────────────────────────────────────────────
@@ -407,8 +452,14 @@ def train(
     run_eval:     bool = True,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
+    _configure_runtime_warnings()
 
-    num_generations = _resolve_num_generations(BATCH_SIZE, N_GENERATIONS)
+    tuned = _auto_tune_for_gpu(torch)
+    batch_size = tuned["batch_size"]
+    grad_accum = tuned["grad_accum"]
+    max_new_tokens = tuned["max_new_tokens"]
+
+    num_generations = _resolve_num_generations(batch_size, N_GENERATIONS)
     if num_generations != N_GENERATIONS:
         print(
             f"[WARN] Adjusted num_generations {N_GENERATIONS} -> {num_generations} "
@@ -423,6 +474,10 @@ def train(
     print(f"  Output:       {output_dir}")
     device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"  Device:       {device_str}")
+    print(
+        f"  Tune:         batch={batch_size}, accum={grad_accum}, "
+        f"max_new_tokens={max_new_tokens}, logging_steps={LOGGING_STEPS}"
+    )
     print(f"{'='*60}\n")
 
     # ── 1. Capture pre-training baseline metrics ──────────────────────────────
@@ -501,11 +556,11 @@ def train(
         "num_generations":              num_generations,
         "temperature":                  TEMPERATURE,
         "learning_rate":                LR,
-        "per_device_train_batch_size":  BATCH_SIZE,
-        "gradient_accumulation_steps":  GRAD_ACCUM,
+        "per_device_train_batch_size":  batch_size,
+        "gradient_accumulation_steps":  grad_accum,
         "num_train_epochs":             1,
         "warmup_ratio":                 WARMUP_RATIO,
-        "logging_steps":                10,
+        "logging_steps":                LOGGING_STEPS,
         "save_steps":                   SAVE_STEPS,
         "save_total_limit":             SAVE_TOTAL_LIMIT,
         "output_dir":                   output_dir,
@@ -523,9 +578,9 @@ def train(
 
     # Compatibility shims for different TRL versions
     if _config_supports("max_completion_length", GRPOConfig):
-        grpo_kwargs["max_completion_length"] = MAX_NEW_TOKENS
+        grpo_kwargs["max_completion_length"] = max_new_tokens
     elif _config_supports("max_new_tokens", GRPOConfig):
-        grpo_kwargs["max_new_tokens"] = MAX_NEW_TOKENS
+        grpo_kwargs["max_new_tokens"] = max_new_tokens
 
     if _config_supports("beta", GRPOConfig):
         grpo_kwargs["beta"] = kl_coeff
@@ -610,6 +665,42 @@ def train(
         trainer_kwargs["config"] = grpo_config
 
     trainer = GRPOTrainer(**trainer_kwargs)
+
+    class LiveMetricsCallback:
+        """Stream concise live metrics into notebook/stdout while training."""
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            logs = logs or {}
+            if not logs:
+                return
+            step = int(logs.get("step", getattr(state, "global_step", 0)) or 0)
+            max_steps = int(getattr(state, "max_steps", 0) or 0)
+            loss = logs.get("loss")
+            lr = logs.get("learning_rate")
+
+            def _avg_last(key: str, window: int = 64) -> float:
+                vals = reward_log.get(key, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
+
+            comp = _avg_last("composite")
+            aman = _avg_last("AMAN")
+            dman = _avg_last("DMAN")
+            gen = _avg_last("GENERATOR")
+            sup = _avg_last("SUPERVISOR")
+            print(
+                "[LIVE] "
+                f"step={step}/{max_steps} "
+                f"loss={loss if loss is not None else 'n/a'} "
+                f"lr={lr if lr is not None else 'n/a'} "
+                f"comp64={comp:.3f} AMAN={aman:.3f} DMAN={dman:.3f} "
+                f"GEN={gen:.3f} SUP={sup:.3f}"
+            )
+
+    if hasattr(trainer, "add_callback"):
+        trainer.add_callback(LiveMetricsCallback())
     
     # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
     _maybe_patch_trainer_sampler(trainer)
@@ -950,6 +1041,7 @@ def _print_final_stats(reward_log: Dict[str, List[float]]) -> None:
 def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> Dict[str, Any]:
     """Run trained model on evaluation episodes."""
     torch, FastLanguageModel, _, _ = _require_training_deps()
+    _configure_runtime_warnings()
 
     print(f"\nEvaluating {model_name_or_path} on {n_episodes} episodes...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -1053,6 +1145,10 @@ def main() -> None:
     parser.add_argument("--n_generations",  type=int, default=None,
                         help="GRPO group size (default: N_GENERATIONS constant). "
                              "Use 2 on T4 Colab, 4 for best gradient quality.")
+    parser.add_argument("--batch_size",     type=int, default=None)
+    parser.add_argument("--grad_accum",     type=int, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--logging_steps",  type=int, default=None)
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
     parser.add_argument("--eval_only",      action="store_true")
@@ -1067,6 +1163,16 @@ def main() -> None:
         # Adjust batch size to stay divisible
         if BATCH_SIZE % N_GENERATIONS != 0:
             BATCH_SIZE = N_GENERATIONS
+
+    global GRAD_ACCUM, MAX_NEW_TOKENS, LOGGING_STEPS
+    if args.batch_size is not None:
+        BATCH_SIZE = max(1, args.batch_size)
+    if args.grad_accum is not None:
+        GRAD_ACCUM = max(1, args.grad_accum)
+    if args.max_new_tokens is not None:
+        MAX_NEW_TOKENS = max(32, args.max_new_tokens)
+    if args.logging_steps is not None:
+        LOGGING_STEPS = max(1, args.logging_steps)
 
     if args.eval_only:
         evaluate(args.model, n_episodes=20, seed=args.seed)
