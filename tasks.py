@@ -25,6 +25,11 @@ except ImportError:
         WakeClass,
     )
 
+try:
+    from .tasks_grounded import GROUNDED_CURRICULUM_TASKS
+except ImportError:
+    from tasks_grounded import GROUNDED_CURRICULUM_TASKS
+
 
 def _f(
     flight_id: str,
@@ -341,7 +346,7 @@ TASKS: List[TaskDefinition] = [
             _f("AIC480", "AIC", OperationType.DEPARTURE, WakeClass.MEDIUM, 30, 30, 52, ["09L"],  175, 2.5, PriorityClass.NORMAL,      0.3, "Second passenger departure — last slot in the crunch window."),
         ],
     ),
-]
+] + GROUNDED_CURRICULUM_TASKS
 
 
 def task_catalog() -> Dict[str, TaskDefinition]:

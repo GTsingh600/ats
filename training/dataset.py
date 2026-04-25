@@ -25,7 +25,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import simulate_plan
 from models import OperationType, SlotAssignment, TaskDefinition
-from tasks import task_catalog, ordered_tasks
+from tasks import ordered_tasks
+from tasks_grounded import GROUNDED_LEVEL_BY_TASK_ID
+from training.curriculum_grounded import (
+    GroundedCurriculumState,
+    grounded_task_proxy_score,
+    pick_grounded_task,
+    solve_grounded_rule_based,
+)
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
@@ -205,6 +212,8 @@ def build_episode_dataset(
     include_supervisor: bool = True,
     include_adapt: bool = True,
     domain_episode_ratio: float = 0.30,
+    use_grounded_curriculum: bool = False,
+    curriculum_state_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
 
@@ -212,20 +221,37 @@ def build_episode_dataset(
     Each episode has: 1 AMAN bid + 1 DMAN bid + optionally 1 negotiation round.
     If include_generator: also 1 generator turn per episode.
     If include_supervisor: also 1 supervisor turn per episode.
+
+    When ``use_grounded_curriculum`` is True, episodes use deterministic canonical
+    tasks (no ChallengeGenerator mutations, no env parametric randomization). Level
+    sampling follows ``pick_grounded_task`` with optional warm-start state from
+    ``curriculum_state_path``. Samples include ``grounded_level``, ``training_band``,
+    and ``curriculum_active_level`` for logging.
     """
     import random
     rng = random.Random(seed)
-    catalog = task_catalog()
     task_list = list(ordered_tasks())
     supervisor = SupervisorAgent()
     env = MultiAgentATCEnvironment(seed=seed)
     generator = ChallengeGenerator(seed=seed)
 
+    grounded_state: Optional[GroundedCurriculumState] = None
+    if use_grounded_curriculum:
+        if curriculum_state_path:
+            from pathlib import Path
+
+            p = Path(curriculum_state_path)
+            if p.is_file():
+                grounded_state = GroundedCurriculumState.from_json_file(p)
+        if grounded_state is None:
+            grounded_state = GroundedCurriculumState()
+        include_generator = False
+
     samples: List[Dict[str, Any]] = []
 
     adapt_episode_ids: set[int] = set()
     domain_tasks: Dict[str, TaskDefinition] = {}
-    if include_adapt:
+    if include_adapt and not use_grounded_curriculum:
         from domains import get_all_domain_tasks
 
         domain_tasks = get_all_domain_tasks()
@@ -237,31 +263,51 @@ def build_episode_dataset(
             adapt_episode_ids = set(ep_ids[:target_adapt])
 
     for ep_id in range(n_episodes):
-        # Difficulty sampled by generator mutate(); labels are logging only.
-        difficulty_scalar = generator.difficulty_scalar
-        difficulty_level = generator.difficulty_level
+        if use_grounded_curriculum:
+            assert grounded_state is not None
+            base_task = pick_grounded_task(rng, ep_id, grounded_state)
+            mutated_task = base_task
+            mutation_types = []
+            task_level = int(GROUNDED_LEVEL_BY_TASK_ID.get(base_task.task_id, 0))
+            difficulty_scalar = float(task_level) / 5.0
+            difficulty_level = task_level
+            proxy_score = grounded_task_proxy_score(mutated_task)
+            if task_level <= 1:
+                band = "calibration"
+            elif task_level <= 3:
+                band = "learning"
+            else:
+                band = "challenge"
+            grounded_meta = {
+                "grounded_curriculum": True,
+                "grounded_level": task_level,
+                "training_band": band,
+                "curriculum_active_level": grounded_state.active_level,
+                "rule_proxy_score": float(proxy_score),
+            }
+        else:
+            base_task = rng.choice(task_list)
+            grounded_meta = {"grounded_curriculum": False}
+            # Apply generator mutation (rule-based for dataset generation)
+            mutated_task, is_solvable = generator.mutate(base_task)
+            mutation_types = generator.last_mutation_types
+            difficulty_scalar = generator.difficulty_scalar
+            difficulty_level = generator.difficulty_level
 
-        base_task = rng.choice(task_list)
         profile = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
-
-        # Apply generator mutation (rule-based for dataset generation)
-        mutated_task, is_solvable = generator.mutate(base_task)
-        mutation_types = generator.last_mutation_types
-        difficulty_scalar = generator.difficulty_scalar
-        difficulty_level = generator.difficulty_level
 
         aman_obs, dman_obs = env.reset(
             episode_id=ep_id,
             supervisor_profile=profile,
             mutated_task=mutated_task,
-            randomize=True,
+            randomize=not use_grounded_curriculum,
         )
 
         atfm_json = json.dumps(env._state.atfm_deadlines)
 
         # AMAN BID sample
-        samples.append(_make_aman_sample(
+        aman_s = _make_aman_sample(
             ep_id=ep_id,
             obs=aman_obs,
             atfm_json=atfm_json,
@@ -270,10 +316,12 @@ def build_episode_dataset(
             profile=profile,
             round_name="bid",
             difficulty_scalar=difficulty_scalar,
-        ))
+        )
+        aman_s.update(grounded_meta)
+        samples.append(aman_s)
 
         # DMAN BID sample
-        samples.append(_make_dman_sample(
+        dman_s = _make_dman_sample(
             ep_id=ep_id,
             obs=dman_obs,
             atfm_json=atfm_json,
@@ -282,7 +330,9 @@ def build_episode_dataset(
             profile=profile,
             round_name="bid",
             difficulty_scalar=difficulty_scalar,
-        ))
+        )
+        dman_s.update(grounded_meta)
+        samples.append(dman_s)
 
         # Generator sample
         if include_generator:
@@ -298,13 +348,21 @@ def build_episode_dataset(
 
         # Supervisor sample (uses a dummy merged plan for dataset; real plan used at inference)
         if include_supervisor:
-            samples.append(_make_supervisor_sample(
+            merged_json = (
+                _build_solver_merged_plan_json(mutated_task)
+                if use_grounded_curriculum
+                else _build_reference_merged_plan_json(mutated_task)
+            )
+            sup_s = _make_supervisor_sample(
                 ep_id=ep_id,
                 task=mutated_task,
                 profile=profile,
                 sup_desc=sup_desc,
                 difficulty_scalar=difficulty_scalar,
-            ))
+                merged_plan_json=merged_json,
+            )
+            sup_s.update(grounded_meta)
+            samples.append(sup_s)
 
         # Add ADAPT sample on selected episodes without removing controller samples.
         if include_adapt and ep_id in adapt_episode_ids and domain_tasks:
@@ -316,9 +374,10 @@ def build_episode_dataset(
             samples.append(_make_adapt_sample(ep_id, obs, dtask, difficulty_scalar=difficulty_scalar))
 
         # Update curriculum using deterministic proxy performance signal.
-        controller_score = _estimate_controller_score(mutated_task)
-        generator.update(controller_score)
-        generator.record(base_task.task_id, mutation_types, controller_score)
+        if not use_grounded_curriculum:
+            controller_score = _estimate_controller_score(mutated_task)
+            generator.update(controller_score)
+            generator.record(base_task.task_id, mutation_types, controller_score)
 
     return samples
 
@@ -423,8 +482,10 @@ def _make_supervisor_sample(
     profile: SupervisorProfileName,
     sup_desc: str,
     difficulty_scalar: float,
+    merged_plan_json: Optional[str] = None,
 ) -> Dict[str, Any]:
-    merged_plan_json = _build_reference_merged_plan_json(task)
+    if merged_plan_json is None:
+        merged_plan_json = _build_reference_merged_plan_json(task)
     system = SUPERVISOR_SYSTEM_TEMPLATE.format(preference=sup_desc)
     user_content = (
         f"Task: {task.task_id}\nAirport: {task.airport}\n"
@@ -444,6 +505,22 @@ def _make_supervisor_sample(
         "merged_plan_json":   merged_plan_json,
         "difficulty_scalar":  float(difficulty_scalar),
     }
+
+
+def _build_solver_merged_plan_json(task: TaskDefinition) -> str:
+    slots = solve_grounded_rule_based(task)
+    if not slots:
+        return _build_reference_merged_plan_json(task)
+    payload = [
+        {
+            "flight_id": str(s.flight_id),
+            "runway": str(s.runway),
+            "assigned_minute": int(s.assigned_minute),
+            "hold_minutes": int(s.hold_minutes),
+        }
+        for s in slots
+    ]
+    return json.dumps(payload)
 
 
 def _build_reference_merged_plan_json(task) -> str:

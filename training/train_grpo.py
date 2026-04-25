@@ -626,6 +626,8 @@ def train(
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
     eval_episodes: int = 3,
+    use_grounded_curriculum: bool = False,
+    curriculum_state_path: Optional[str] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -669,9 +671,16 @@ def train(
 
     # Hold out unseen scenarios for validation/debugging.
     all_task_ids = [t.task_id for t in ordered_tasks()]
-    holdout_count = max(1, int(round(0.2 * len(all_task_ids)))) if all_task_ids else 0
     holdout_rng = random.Random(seed + 173)
-    holdout_task_ids = set(holdout_rng.sample(all_task_ids, holdout_count)) if holdout_count else set()
+    non_grounded_ids = [tid for tid in all_task_ids if not tid.startswith("gc_")]
+    if use_grounded_curriculum:
+        holdout_task_ids = set()
+        print("[INFO] Grounded curriculum: no holdout split for gc_* tasks (all used for training).")
+    else:
+        hc = max(1, int(round(0.2 * len(non_grounded_ids)))) if non_grounded_ids else 0
+        holdout_task_ids = (
+            set(holdout_rng.sample(non_grounded_ids, hc)) if hc else set()
+        )
     if holdout_task_ids:
         print(f"[INFO] Holdout task set ({len(holdout_task_ids)}): {sorted(holdout_task_ids)}")
 
@@ -731,10 +740,12 @@ def train(
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
         seed=seed,
-        include_generator=True,
+        include_generator=not use_grounded_curriculum,
         include_supervisor=True,
-        include_adapt=True,
+        include_adapt=not use_grounded_curriculum,
         domain_episode_ratio=0.30,
+        use_grounded_curriculum=use_grounded_curriculum,
+        curriculum_state_path=curriculum_state_path,
     )
     print(f"    Dataset (pre-split): {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
@@ -747,6 +758,24 @@ def train(
         if s.get("task_id") in holdout_task_ids
     ]
     print(f"    Train samples: {len(dataset_train)} | Holdout samples: {len(dataset_val)}")
+
+    if use_grounded_curriculum:
+        band_counts: Dict[str, int] = {}
+        level_counts: Dict[int, int] = {}
+        for s in dataset_train:
+            if not s.get("grounded_curriculum"):
+                continue
+            b = s.get("training_band", "unknown")
+            band_counts[b] = band_counts.get(b, 0) + 1
+            lev = int(s.get("grounded_level", -1))
+            if lev >= 0:
+                level_counts[lev] = level_counts.get(lev, 0) + 1
+        grounded_summary = {
+            "training_band_counts": band_counts,
+            "grounded_level_counts": {str(k): v for k, v in sorted(level_counts.items())},
+        }
+        _save_json(grounded_summary, Path(output_dir) / "grounded_dataset_summary.json")
+        print(f"    Grounded dataset summary: {grounded_summary}")
 
     role_counts: Dict[str, int] = {}
     for s in dataset_train:
@@ -1628,6 +1657,16 @@ def main() -> None:
     parser.add_argument("--eval_only",      action="store_true")
     parser.add_argument("--push_to_hub",    action="store_true")
     parser.add_argument("--hub_model_id",   default=None)
+    parser.add_argument(
+        "--grounded_curriculum",
+        action="store_true",
+        help="Train on deterministic grounded gc_* tasks only (no generator, no ADAPT, no env randomize).",
+    )
+    parser.add_argument(
+        "--curriculum_state",
+        default=None,
+        help="Optional path to grounded_curriculum_state.json from a prior run (warm-start stats).",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -1663,6 +1702,8 @@ def main() -> None:
             hub_model_id=args.hub_model_id,
             run_eval=not args.no_eval,
             eval_episodes=max(1, int(args.eval_episodes)),
+            use_grounded_curriculum=bool(args.grounded_curriculum),
+            curriculum_state_path=args.curriculum_state,
         )
 
 
