@@ -440,8 +440,16 @@ def generator_reward_fn(
             rewards.append(-0.5)
             continue
 
-        _, is_solvable = _GENERATOR.mutate(task, gen_action)
-        reward = _GENERATOR.compute_reward(_safe_float(ctrl_score), is_solvable)
+        try:
+            _, is_solvable = _GENERATOR.mutate(task, gen_action)
+            reward = _GENERATOR.compute_reward(_safe_float(ctrl_score), is_solvable)
+        except Exception as exc:
+            # LLM may emit invalid param types (e.g. flight_id as int).
+            # Penalise but don't crash training — the source bug is also fixed
+            # in generator.py, but this guard handles any future schema drift.
+            if _TRACE_REWARDS:
+                print(f"[REWARD TRACE] generator mutate failed: {exc}")
+            reward = -0.4 + _parse_partial_credit(completion)
         rewards.append(round(max(-1.0, min(1.0, reward)), 4))
 
     return rewards
