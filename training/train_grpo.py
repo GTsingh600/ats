@@ -3,7 +3,7 @@
 Architecture:
   - Single LLM (Qwen2.5-7B-Instruct, 4-bit QLoRA) plays 4 roles via system prompts
   - GRPO: group-relative advantage  A_i = (r_i - mean(group)) / (std(group) + eps)
-  - Four independent reward functions (AMAN, DMAN, GENERATOR, SUPERVISOR)
+  - Five reward heads (AMAN, DMAN, GENERATOR, SUPERVISOR, ADAPT)
   - Potential-based reward shaping per role (policy-gradient safe, Ng et al. 1999)
   - Adaptive curriculum: ChallengeGenerator escalates difficulty as agents improve
   - Per-role reward curves saved to reward_curves.json for demo
@@ -40,6 +40,7 @@ import re
 import sys
 import time
 import warnings
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -82,6 +83,14 @@ def _require_training_deps():
 from training.continuous_curriculum import (
     load_or_create_continuous_state,
     save_continuous_state,
+)
+from training.roster_integrity import (
+    ROSTER_PACK_SIZE,
+    align_batch_size_to_roster,
+    assert_batch_role_counts,
+    assert_dataset_has_full_roster,
+    format_role_distribution,
+    strict_roster_enabled,
 )
 from training.dataset import (
     build_episode_dataset,
@@ -647,6 +656,23 @@ def train(
     grad_accum = tuned["grad_accum"]
     max_new_tokens = max(tuned["max_new_tokens"], max(ROLE_MAX_NEW_TOKENS.values()))
 
+    grounded_live_early = (
+        use_grounded_curriculum
+        and os.environ.get("ATC_STATIC_GROUNDED_DATASET", "").lower() not in {"1", "true", "yes"}
+    )
+    if strict_roster_enabled(
+        grounded_live=grounded_live_early,
+        use_grounded_curriculum=use_grounded_curriculum,
+    ):
+        nb = align_batch_size_to_roster(batch_size, ROSTER_PACK_SIZE)
+        if nb != batch_size:
+            print(
+                f"[STRICT_ROSTER] batch_size {batch_size} -> {nb} "
+                f"(multiple of {ROSTER_PACK_SIZE} for full multi-agent batches)"
+            )
+        batch_size = nb
+        tuned["batch_size"] = batch_size
+
     num_generations = _resolve_num_generations(batch_size, N_GENERATIONS)
     if num_generations != N_GENERATIONS:
         print(
@@ -798,6 +824,15 @@ def train(
         _row_it = iter_live_grounded_rows(curriculum_manager, int(seed))
         for _ in range(_max_rows):
             _buf.append(next(_row_it))
+        if strict_roster_enabled(
+            grounded_live=True,
+            use_grounded_curriculum=True,
+        ):
+            _trim = len(_buf) % ROSTER_PACK_SIZE
+            if _trim:
+                del _buf[-_trim:]
+                print(f"[STRICT_ROSTER] trimmed {_trim} tail rows for pack alignment (n={len(_buf)})")
+            assert_dataset_has_full_roster(_buf, context="live_materialized")
         try:
             from datasets import Dataset as HFDataset
         except ImportError:
@@ -823,9 +858,9 @@ def train(
         dataset_raw = build_episode_dataset(
             n_episodes=n_episodes,
             seed=seed,
-            include_generator=not use_grounded_curriculum,
+            include_generator=True,
             include_supervisor=True,
-            include_adapt=not use_grounded_curriculum,
+            include_adapt=True,
             domain_episode_ratio=0.30,
             use_grounded_curriculum=use_grounded_curriculum,
             curriculum_state_path=curriculum_state_path,
@@ -897,6 +932,17 @@ def train(
             print("[ERROR] pip install datasets")
             sys.exit(1)
 
+        if use_grounded_curriculum and strict_roster_enabled(
+            grounded_live=False,
+            use_grounded_curriculum=True,
+        ):
+            _trim_s = len(dataset_train) % ROSTER_PACK_SIZE
+            if _trim_s:
+                dataset_train = dataset_train[: len(dataset_train) - _trim_s]
+                dataset = Dataset.from_list(dataset_train)
+                print(f"[STRICT_ROSTER] trimmed {_trim_s} static rows (n={len(dataset_train)})")
+            assert_dataset_has_full_roster(dataset_train, context="static_grounded")
+
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
     if curriculum_manager is not None:
@@ -959,10 +1005,23 @@ def train(
     if _config_supports("use_vllm", GRPOConfig):
         grpo_kwargs["use_vllm"] = False
 
+    if strict_roster_enabled(
+        grounded_live=grounded_live,
+        use_grounded_curriculum=use_grounded_curriculum,
+    ) and _config_supports("shuffle_train_dataset", GRPOConfig):
+        grpo_kwargs["shuffle_train_dataset"] = False
+        print("[STRICT_ROSTER] shuffle_train_dataset=False (preserve roster packs)")
+
     grpo_config = GRPOConfig(**grpo_kwargs)
 
     # ── 5. Per-role reward logger ─────────────────────────────────────────────
     print("\n[4/5] Setting up per-role reward logging...")
+
+    strict_roster = strict_roster_enabled(
+        grounded_live=grounded_live,
+        use_grounded_curriculum=use_grounded_curriculum,
+    )
+    sup_reward_ring: deque[float] = deque(maxlen=512)
 
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
@@ -1079,6 +1138,28 @@ def train(
                 roles = roles + [
                     roles[-1] if roles else AgentRole.AMAN.value
                 ] * (len(rewards) - len(roles))
+
+            if strict_roster and len(roles) == len(rewards) and rewards:
+                assert_batch_role_counts(
+                    [str(x) for x in roles],
+                    batch_index=len(batch_diagnostics),
+                )
+                print(
+                    f"[ROSTER] batch={len(batch_diagnostics)} "
+                    f"{format_role_distribution(dict(Counter(str(x) for x in roles)))}"
+                )
+            for role_i, r_i in zip(roles, rewards):
+                if role_i == AgentRole.SUPERVISOR.value:
+                    sup_reward_ring.append(float(r_i))
+            if strict_roster and len(sup_reward_ring) >= 48:
+                tail = list(sup_reward_ring)[-48:]
+                m = sum(tail) / len(tail)
+                v = sum((x - m) ** 2 for x in tail) / len(tail)
+                if v < 1e-14:
+                    raise RuntimeError(
+                        "Supervisor reward variance collapsed (strict roster integrity). "
+                        "Inspect supervisor_reward_fn and merged_plan_json inputs."
+                    )
 
             def _is_parse_ok(role: str, completion: Any) -> int:
                 if role == AgentRole.AMAN.value:

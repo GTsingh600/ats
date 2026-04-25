@@ -7,6 +7,10 @@
 - Structural edits: runway capacity, weather penalty, delay budget, window widths — all
   solver-gated; rejects scenarios whose difficulty proxy diverges from ``d``.
 - ``IterableDataset`` yields rows indefinitely; training uses ``max_steps`` to terminate.
+
+Each episode emits ``ROSTER_PACK_SIZE`` rows: AMAN, DMAN, GENERATOR, SUPERVISOR,
+and two ADAPT rows (domain transfer + grounded shift) so ADAPT is ≥25% of samples
+and every aligned batch can include all roles.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import os
 import random
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from models import RunwaySpec, TaskDefinition
 
@@ -35,11 +39,18 @@ from training.curriculum_grounded import grounded_task_proxy_score
 from training.dataset import (
     SUPERVISOR_PROFILES,
     _build_solver_merged_plan_json,
+    _estimate_controller_score,
     _make_aman_sample,
     _make_dman_sample,
+    _make_generator_sample,
     _make_supervisor_sample,
+    conflict_proxy_from_solver,
 )
+from training.adapt_curriculum import build_dual_adapt_samples
+from training.roster_integrity import ROSTER_PACK_SIZE
+from domains import get_all_domain_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.generator import ChallengeGenerator
 from multi_agent.supervisor import SupervisorAgent
 
 
@@ -76,8 +87,15 @@ class CurriculumManager:
         self.save_every_batches = int(save_every_batches)
         self.env = MultiAgentATCEnvironment(seed=seed)
         self.supervisor = SupervisorAgent()
+        self.generator = ChallengeGenerator(seed=seed)
+        try:
+            self._domain_tasks = get_all_domain_tasks()
+        except Exception:
+            self._domain_tasks = {}
         self._episode_seq = 0
         self._dist_log_path = self.output_dir / "curriculum_effective_distribution.jsonl"
+        self._last_generator_entropy_bits: float = 0.0
+        self._last_structural_divergence: float = 0.0
 
     def _fork_rng(self) -> random.Random:
         with self._lock:
@@ -103,7 +121,7 @@ class CurriculumManager:
         rng: random.Random,
         recent_keys: Optional[Set[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], float, str, float]:
-        """Return (three samples AMAN/DMAN/SUP), target d, template_id, difficulty proxy."""
+        """Return ``ROSTER_PACK_SIZE`` samples: AMAN, DMAN, GENERATOR, SUPERVISOR, ADAPT×2."""
         recent_keys = recent_keys or set()
         best_pack: Optional[List[Dict[str, Any]]] = None
         best_d = 0.0
@@ -119,9 +137,15 @@ class CurriculumManager:
             if abs(proxy - d) > self.proxy_tolerance:
                 continue
             sig = structural_signature_tuple(task)
+            sig_t = structural_signature_tuple(template)
+            if sig == sig_t and attempt < self.resample_attempts - 1:
+                continue
             key = f"{task.task_id}|{sig}"
             if recent_keys and key in recent_keys and attempt < self.resample_attempts - 3:
                 continue
+            ctrl = float(_estimate_controller_score(task))
+            self.generator.update(ctrl)
+
             profile = self.supervisor.sample_profile(ep_id)
             sup_desc = SUPERVISOR_PROFILES[profile]["description"]
             aman_obs, dman_obs = self.env.reset(
@@ -133,6 +157,9 @@ class CurriculumManager:
             atfm_json = json.dumps(self.env._state.atfm_deadlines)
             ps = float(grounded_task_proxy_score(task))
             bidx = bucket_index(d)
+            div = 0.0 if sig == sig_t else 1.0
+            self._last_structural_divergence = div
+            self._last_generator_entropy_bits = float(div + min(1.0, abs(proxy - d)))
             meta = {
                 "grounded_curriculum": True,
                 "live_curriculum": True,
@@ -143,7 +170,42 @@ class CurriculumManager:
                 "structural_signature": json.dumps(sig),
                 "rule_proxy_score": ps,
                 "training_band": f"log_quartile_{bidx}",
+                "generator_from_grounded": True,
+                "generator_structural_divergence": div,
+                "generator_entropy_hint_bits": self._last_generator_entropy_bits,
             }
+            gen_row = _make_generator_sample(
+                ep_id,
+                template,
+                profile,
+                self.generator.difficulty_level,
+                self.generator.ema_score,
+                float(d),
+                self.generator.difficulty_distribution,
+            )
+            sup_row = _make_supervisor_sample(
+                ep_id,
+                task,
+                profile,
+                sup_desc,
+                float(d),
+                merged_plan_json=_build_solver_merged_plan_json(task),
+            )
+            if not self._domain_tasks:
+                raise RuntimeError(
+                    "Live curriculum requires non-empty domain tasks for ADAPT "
+                    "(see domains/ registry)."
+                )
+            adapt_rows, trig = build_dual_adapt_samples(
+                ep_id,
+                mutated_grounded_task=task,
+                profile=profile,
+                d=float(d),
+                rng=rng,
+                domain_tasks=self._domain_tasks,
+                conflict_proxy=conflict_proxy_from_solver(task),
+            )
+            meta["adapt_bundle_triggers"] = trig
             rows = [
                 _make_aman_sample(
                     ep_id, aman_obs, atfm_json, "[]", sup_desc, profile, "bid", float(d)
@@ -151,15 +213,10 @@ class CurriculumManager:
                 _make_dman_sample(
                     ep_id, dman_obs, atfm_json, "[]", sup_desc, profile, "bid", float(d)
                 ),
-                _make_supervisor_sample(
-                    ep_id,
-                    task,
-                    profile,
-                    sup_desc,
-                    float(d),
-                    merged_plan_json=_build_solver_merged_plan_json(task),
-                ),
+                gen_row,
+                sup_row,
             ]
+            rows.extend(adapt_rows)
             for r in rows:
                 r.update(meta)
             best_pack = rows
@@ -195,18 +252,45 @@ class CurriculumManager:
                 "rule_proxy_score": float(grounded_task_proxy_score(task)),
                 "training_band": "log_fallback",
             }
+            ctrl = float(_estimate_controller_score(task))
+            self.generator.update(ctrl)
+            gen_row = _make_generator_sample(
+                ep_id,
+                template,
+                profile,
+                self.generator.difficulty_level,
+                self.generator.ema_score,
+                float(d),
+                self.generator.difficulty_distribution,
+            )
+            sup_row = _make_supervisor_sample(
+                ep_id,
+                task,
+                profile,
+                sup_desc,
+                float(d),
+                merged_plan_json=_build_solver_merged_plan_json(task),
+            )
+            if not self._domain_tasks:
+                raise RuntimeError("domains/ registry empty — cannot build ADAPT rows.")
+            adapt_rows, trig = build_dual_adapt_samples(
+                ep_id,
+                mutated_grounded_task=task,
+                profile=profile,
+                d=float(d),
+                rng=rng,
+                domain_tasks=self._domain_tasks,
+                conflict_proxy=conflict_proxy_from_solver(task),
+            )
+            meta["adapt_bundle_triggers"] = trig
+            meta["generator_from_grounded"] = True
             best_pack = [
                 _make_aman_sample(ep_id, aman_obs, atfm_json, "[]", sup_desc, profile, "bid", float(d)),
                 _make_dman_sample(ep_id, dman_obs, atfm_json, "[]", sup_desc, profile, "bid", float(d)),
-                _make_supervisor_sample(
-                    ep_id,
-                    task,
-                    profile,
-                    sup_desc,
-                    float(d),
-                    merged_plan_json=_build_solver_merged_plan_json(task),
-                ),
+                gen_row,
+                sup_row,
             ]
+            best_pack.extend(adapt_rows)
             for r in best_pack:
                 r.update(meta)
             best_d = d
@@ -284,8 +368,8 @@ def iter_live_grounded_rows(
 
 
 def live_max_steps(n_episodes: int, batch_size: int, grad_accum: int, passes: float = 2.5) -> int:
-    """Approximate steps to cover ``passes`` virtual epochs over AMAN+DMAN+SUP rows."""
-    rows_per_ep = 3
+    """Approximate steps to cover ``passes`` virtual epochs over full roster rows per episode."""
+    rows_per_ep = ROSTER_PACK_SIZE
     total_rows = max(1, int(n_episodes * rows_per_ep * passes))
     eff_bs = max(1, int(batch_size) * max(1, int(grad_accum)))
     return max(64, (total_rows + eff_bs - 1) // eff_bs)

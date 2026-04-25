@@ -30,7 +30,16 @@ def test_build_episode_dataset_grounded_smoke():
     )
     assert rows
     gc_rows = [r for r in rows if r.get("grounded_curriculum")]
-    assert len(gc_rows) == 16 * 3  # AMAN + DMAN + SUP per episode, no GEN/ADAPT
-    assert all(r["task_id"].startswith("gc_") for r in gc_rows)
+    # AMAN + DMAN + GENERATOR + SUPERVISOR + 2×ADAPT per episode (full roster)
+    assert len(gc_rows) == 16 * 6
     assert all("continuous_difficulty" in r for r in gc_rows)
     assert set(r["training_band"] for r in gc_rows) <= {f"bucket_{i}" for i in range(4)}
+    roles = [r["agent_role"] for r in gc_rows]
+    assert roles.count("AMAN") == 16
+    assert roles.count("DMAN") == 16
+    assert roles.count("GENERATOR") == 16
+    assert roles.count("SUPERVISOR") == 16
+    assert roles.count("ADAPT") == 32
+    for r in gc_rows:
+        if r.get("agent_role") in ("AMAN", "DMAN", "SUPERVISOR", "GENERATOR"):
+            assert str(r.get("task_id", "")).startswith("gc_")

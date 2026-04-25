@@ -42,6 +42,17 @@ from training.curriculum_grounded import (
     grounded_task_proxy_score,
     solve_grounded_rule_based,
 )
+def conflict_proxy_from_solver(task: TaskDefinition) -> float:
+    """Normalised conflict pressure [0,1] from solver-merged plan (for ADAPT triggers)."""
+    try:
+        raw = _build_solver_merged_plan_json(task)
+        slots = [SlotAssignment(**s) for s in json.loads(raw)]
+        oc = simulate_plan(task, slots)
+        return min(1.0, oc.metrics.conflict_count / max(1, len(task.flights)))
+    except Exception:
+        return 0.0
+
+
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
@@ -262,7 +273,6 @@ def build_episode_dataset(
                 grounded_state = GroundedCurriculumState.from_json_file(p)
         if grounded_state is None:
             grounded_state = GroundedCurriculumState()
-        include_generator = False
 
         from pathlib import Path as _Path
 
@@ -279,16 +289,17 @@ def build_episode_dataset(
 
     adapt_episode_ids: set[int] = set()
     domain_tasks: Dict[str, TaskDefinition] = {}
-    if include_adapt and not use_grounded_curriculum:
+    if include_adapt:
         from domains import get_all_domain_tasks
 
         domain_tasks = get_all_domain_tasks()
-        ratio = max(0.25, min(0.30, max(0.0, float(domain_episode_ratio))))
-        target_adapt = max(0, min(n_episodes, int(round(n_episodes * ratio))))
-        if target_adapt > 0:
-            ep_ids = list(range(n_episodes))
-            rng.shuffle(ep_ids)
-            adapt_episode_ids = set(ep_ids[:target_adapt])
+        if not use_grounded_curriculum:
+            ratio = max(0.25, min(0.30, max(0.0, float(domain_episode_ratio))))
+            target_adapt = max(0, min(n_episodes, int(round(n_episodes * ratio))))
+            if target_adapt > 0:
+                ep_ids = list(range(n_episodes))
+                rng.shuffle(ep_ids)
+                adapt_episode_ids = set(ep_ids[:target_adapt])
 
     for ep_id in range(n_episodes):
         if use_grounded_curriculum:
@@ -369,7 +380,7 @@ def build_episode_dataset(
 
         # Generator sample
         if include_generator:
-            samples.append(_make_generator_sample(
+            gen_s = _make_generator_sample(
                 ep_id=ep_id,
                 task=base_task,
                 profile=profile,
@@ -377,7 +388,11 @@ def build_episode_dataset(
                 ema_score=generator.ema_score,
                 difficulty_scalar=difficulty_scalar,
                 difficulty_distribution=generator.difficulty_distribution,
-            ))
+            )
+            gen_s.update(grounded_meta)
+            if use_grounded_curriculum:
+                gen_s["generator_from_grounded"] = True
+            samples.append(gen_s)
 
         # Supervisor sample (uses a dummy merged plan for dataset; real plan used at inference)
         if include_supervisor:
@@ -397,20 +412,37 @@ def build_episode_dataset(
             sup_s.update(grounded_meta)
             samples.append(sup_s)
 
-        # Add ADAPT sample on selected episodes without removing controller samples.
-        if include_adapt and ep_id in adapt_episode_ids and domain_tasks:
-            from multi_agent.adapt import build_adapt_observation
+        if include_adapt and domain_tasks:
+            from training.adapt_curriculum import build_dual_adapt_samples
 
-            tid = rng.choice(list(domain_tasks.keys()))
-            dtask = domain_tasks[tid]
-            obs = build_adapt_observation(dtask, profile)
-            samples.append(_make_adapt_sample(ep_id, obs, dtask, difficulty_scalar=difficulty_scalar))
+            if use_grounded_curriculum:
+                adapt_rows, trig = build_dual_adapt_samples(
+                    ep_id,
+                    mutated_grounded_task=mutated_task,
+                    profile=profile,
+                    d=float(difficulty_scalar),
+                    rng=rng,
+                    domain_tasks=domain_tasks,
+                    conflict_proxy=conflict_proxy_from_solver(mutated_task),
+                )
+                for ar in adapt_rows:
+                    ar.update(grounded_meta)
+                    ar["adapt_bundle_triggers"] = trig
+                    samples.append(ar)
+            elif ep_id in adapt_episode_ids:
+                from multi_agent.adapt import build_adapt_observation
 
-        # Update curriculum using deterministic proxy performance signal.
+                tid = rng.choice(list(domain_tasks.keys()))
+                dtask = domain_tasks[tid]
+                obs = build_adapt_observation(dtask, profile)
+                samples.append(_make_adapt_sample(ep_id, obs, dtask, difficulty_scalar=difficulty_scalar))
+
+        controller_score = _estimate_controller_score(mutated_task)
+        generator.update(controller_score)
         if not use_grounded_curriculum:
-            controller_score = _estimate_controller_score(mutated_task)
-            generator.update(controller_score)
             generator.record(base_task.task_id, mutation_types, controller_score)
+        elif include_generator:
+            generator.record(base_task.task_id, mutation_types if mutation_types else [], controller_score)
 
     return samples
 
@@ -591,6 +623,7 @@ def _make_adapt_sample(
         ],
         "task_id": "domain_transfer",
         "agent_role": AgentRole.ADAPT.value,
+        "episode_id": int(ep_id),
         "round": "adapt",
         "domain_task_json": domain_task.model_dump_json(),
         "supervisor_profile": obs.supervisor_profile_name.value,

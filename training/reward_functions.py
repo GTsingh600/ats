@@ -621,13 +621,26 @@ def supervisor_reward_fn(
         outcome = simulate_plan(task, slots)
         profile = _safe_supervisor_profile(profile_str)
         score = _SUPERVISOR.score_plan(outcome, task, profile)
+        coord = min(1.0, max(0.0, float(outcome.normalized_score)))
+        conflict_norm = min(
+            1.0,
+            outcome.metrics.conflict_count / max(1, len(task.flights)),
+        )
+        structural = (
+            0.20 * coord
+            + 0.12 * (1.0 - conflict_norm)
+            + 0.10 * float(outcome.metrics.schedule_completeness)
+        )
 
         supervisor_claimed = _extract_supervisor_score(completion)
         calibration_bonus = 0.0
         if supervisor_claimed is not None:
-            calibration_bonus = max(0.0, 0.2 - abs(supervisor_claimed - score))
+            calibration_bonus = max(0.0, 0.18 - abs(supervisor_claimed - score))
 
-        rewards.append(round(min(1.0, score + calibration_bonus), 4))
+        breadth = _supervisor_completion_breadth(completion)
+        reward_val = 0.48 * float(score) + structural + calibration_bonus + breadth
+        reward_val = max(0.0, min(1.0, reward_val))
+        rewards.append(round(reward_val, 4))
 
     return rewards
 
@@ -865,6 +878,22 @@ def _extract_supervisor_score(completion: Any) -> Optional[float]:
         if match:
             return float(match.group(1))
     return None
+
+
+def _supervisor_completion_breadth(completion: Any) -> float:
+    """Small verifiable spread from completion text so supervisor rewards are not bit-collapsed."""
+    text = _coerce_completion_text(completion)
+    if not text.strip():
+        return 0.0
+    bonus = 0.0
+    tl = text.lower()
+    if "alignment" in tl:
+        bonus += 0.035
+    if "violation" in tl:
+        bonus += 0.03
+    if len(text) > 120:
+        bonus += 0.03
+    return min(0.10, bonus)
 
 
 def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
