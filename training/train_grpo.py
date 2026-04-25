@@ -701,6 +701,9 @@ def train(
                 tail = vals[-min(window, len(vals)) :]
                 return sum(tail) / max(1, len(tail))
 
+            def _fmt(v: float) -> str:
+                return "n/a" if v != v else f"{v:.3f}"
+
             comp = _avg_last("composite")
             aman = _avg_last("AMAN")
             dman = _avg_last("DMAN")
@@ -711,8 +714,8 @@ def train(
                 f"step={step}/{max_steps} "
                 f"loss={loss if loss is not None else 'n/a'} "
                 f"lr={lr if lr is not None else 'n/a'} "
-                f"comp64={comp:.3f} AMAN={aman:.3f} DMAN={dman:.3f} "
-                f"GEN={gen:.3f} SUP={sup:.3f}"
+                f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
+                f"GEN={_fmt(gen)} SUP={_fmt(sup)}"
             )
 
     if hasattr(trainer, "add_callback"):

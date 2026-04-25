@@ -350,6 +350,7 @@ def _make_supervisor_sample(
     profile: SupervisorProfileName,
     sup_desc: str,
 ) -> Dict[str, Any]:
+    merged_plan_json = _build_reference_merged_plan_json(task)
     system = SUPERVISOR_SYSTEM_TEMPLATE.format(preference=sup_desc)
     user_content = (
         f"Task: {task.task_id}\nAirport: {task.airport}\n"
@@ -366,8 +367,30 @@ def _make_supervisor_sample(
         "episode_id":         ep_id,
         "round":              "evaluate",
         "supervisor_profile": profile.value,
-        "merged_plan_json":   "[]",
+        "merged_plan_json":   merged_plan_json,
     }
+
+
+def _build_reference_merged_plan_json(task) -> str:
+    """Build a deterministic full-plan baseline for supervisor training."""
+    slots: List[Dict[str, Any]] = []
+    for flight in task.flights:
+        if not flight.allowed_runways:
+            continue
+        assigned_minute = max(
+            int(flight.earliest_minute),
+            min(int(flight.latest_minute), int(flight.scheduled_minute)),
+        )
+        hold_minutes = max(0, abs(assigned_minute - int(flight.scheduled_minute)))
+        slots.append(
+            {
+                "flight_id": str(flight.flight_id),
+                "runway": str(flight.allowed_runways[0]),
+                "assigned_minute": int(assigned_minute),
+                "hold_minutes": int(hold_minutes),
+            }
+        )
+    return json.dumps(slots)
 
 
 # ── Action parsers (completion → typed action) ────────────────────────────────

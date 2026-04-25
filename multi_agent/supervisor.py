@@ -81,6 +81,11 @@ class SupervisorAgent:
             + w_priority * metrics.priority_handling
         ) / total_w
 
+        # Guardrail: never reward a "nice-looking" but incomplete plan.
+        # Without this, an empty plan can score unrealistically high because
+        # conflict/delay/fuel/fairness metrics default to favorable values.
+        raw *= max(0.0, min(1.0, metrics.schedule_completeness))
+
         # Emergency focus profile: hard penalty if any emergency missed
         if profile_name == SupervisorProfileName.EMERGENCY_FOCUS:
             if metrics.emergency_violations > 0 or metrics.medical_violations > 0:
