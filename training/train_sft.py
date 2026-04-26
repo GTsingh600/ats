@@ -26,6 +26,9 @@ os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 # Match kube-sre-gym / long GRPO runs: https://raw.githubusercontent.com/sid-rp/kube-sre-gym/main/train.py
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+# Avoid optional fast-generation vLLM hooks that can trigger noisy NumPy/cv2
+# import failures on mixed binary stacks (NumPy 2 + NumPy-1-built extensions).
+os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
 
 
 def main() -> None:

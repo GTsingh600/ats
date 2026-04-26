@@ -52,6 +52,9 @@ if str(ROOT) not in sys.path:
 #   https://raw.githubusercontent.com/sid-rp/kube-sre-gym/main/train.py
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+# Avoid optional fast-generation vLLM hooks that can trigger noisy NumPy/cv2
+# import failures on mixed binary stacks (NumPy 2 + NumPy-1-built extensions).
+os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
 
 def _require_training_deps():
     if sys.version_info >= (3, 14):
@@ -203,10 +206,11 @@ def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
         vram_gb = torch_module.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     except Exception:
         return tuned
+    high_vram_mode = os.environ.get("ATC_HIGH_VRAM_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
     # 80GB-class GPUs: increase throughput while keeping rollout quality.
     if vram_gb >= 70:
-        tuned["batch_size"] = max(tuned["batch_size"], 8)
+        tuned["batch_size"] = max(tuned["batch_size"], 12 if high_vram_mode else 8)
         tuned["grad_accum"] = 1
         tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 384)
     elif vram_gb >= 40:
@@ -783,6 +787,8 @@ def train(
         f"  Tune:         batch={batch_size}, accum={grad_accum}, "
         f"max_new_tokens={max_new_tokens}, temp={TEMPERATURE}, logging_steps={LOGGING_STEPS}"
     )
+    if os.environ.get("ATC_HIGH_VRAM_MODE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print("  VRAM mode:    HIGH (ATC_HIGH_VRAM_MODE=1)")
     print(
         "  Role tokens:  "
         f"AMAN={ROLE_MAX_NEW_TOKENS[AgentRole.AMAN.value]}, "
@@ -1132,6 +1138,7 @@ def train(
         use_grounded_curriculum=use_grounded_curriculum,
     )
     sup_reward_ring: deque[float] = deque(maxlen=512)
+    sup_plan_ring: deque[str] = deque(maxlen=512)
 
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
@@ -1253,6 +1260,13 @@ def train(
                 kwargs["difficulty_scalar"] = _expand_kw_to_completions(
                     _n, _coerce_scalar_list(kwargs.get("difficulty_scalar")), name="difficulty_scalar"
                 )
+            if "merged_plan_json" in kwargs:
+                _raw_plans = kwargs.get("merged_plan_json")
+                if not isinstance(_raw_plans, list):
+                    _raw_plans = [_raw_plans]
+                kwargs["merged_plan_json"] = _expand_kw_to_completions(
+                    _n, [str(x) for x in _raw_plans], name="merged_plan_json"
+                )
 
             rewards = combined_reward_fn(completions, **kwargs)
 
@@ -1270,15 +1284,6 @@ def train(
             for role_i, r_i in zip(roles, rewards):
                 if role_i == AgentRole.SUPERVISOR.value:
                     sup_reward_ring.append(float(r_i))
-            if strict_roster and len(sup_reward_ring) >= 48:
-                tail = list(sup_reward_ring)[-48:]
-                m = sum(tail) / len(tail)
-                v = sum((x - m) ** 2 for x in tail) / len(tail)
-                if v < 1e-14:
-                    raise RuntimeError(
-                        "Supervisor reward variance collapsed (strict roster integrity). "
-                        "Inspect supervisor_reward_fn and merged_plan_json inputs."
-                    )
 
             def _is_parse_ok(role: str, completion: Any) -> int:
                 if role == AgentRole.AMAN.value:
@@ -1305,6 +1310,9 @@ def train(
                 raw_difficulty = [raw_difficulty] * len(rewards)
 
             for idx, (completion, r, role) in enumerate(zip(completions, rewards, roles)):
+                if role == AgentRole.SUPERVISOR.value:
+                    plan_i = _select_sample_value(kwargs.get("merged_plan_json", []), idx)
+                    sup_plan_ring.append(str(plan_i))
                 if role in reward_log:
                     reward_log[role].append(r)
                     role_reward_batch[role].append(r)
@@ -1364,6 +1372,26 @@ def train(
                         4,
                     )
             batch_diagnostics.append(batch_summary)
+
+            if strict_roster and len(sup_reward_ring) >= 48:
+                sup_r_tail = list(sup_reward_ring)[-48:]
+                sup_p_tail = parse_log.get("SUPERVISOR", [])[-48:]
+                sup_sig_tail = action_signature_log.get("SUPERVISOR", [])[-48:]
+                sup_plan_tail = list(sup_plan_ring)[-48:]
+                collapse = _supervisor_collapse_diagnostics(
+                    sup_rewards_tail=[float(x) for x in sup_r_tail],
+                    sup_parse_tail=[int(x) for x in sup_p_tail],
+                    sup_action_sig_tail=[str(x) for x in sup_sig_tail],
+                    sup_plan_json_tail=[str(x) for x in sup_plan_tail],
+                )
+                if collapse["should_raise"]:
+                    raise RuntimeError(
+                        "Supervisor reward collapse (strict roster integrity): "
+                        f"std={collapse['reward_std']} parse={collapse['parse_rate']} "
+                        f"div={collapse['action_diversity']} "
+                        f"nonempty_plan_ratio={collapse['nonempty_plan_ratio']}. "
+                        "Inspect supervisor_reward_fn metadata plumbing (merged_plan_json/supervisor_profile)."
+                    )
 
             if rewards and (curriculum_manager is not None or (use_grounded_curriculum and cc_runtime is not None)):
                 ds_batch: List[float] = []
@@ -1959,6 +1987,60 @@ def _list_std(vals: List[float]) -> float:
         return 0.0
     m = sum(vals) / len(vals)
     return math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
+
+
+def _plan_json_nonempty_ratio(plan_json_tail: List[str]) -> float:
+    if not plan_json_tail:
+        return 0.0
+    nonempty = 0
+    for raw in plan_json_tail:
+        try:
+            payload = json.loads(str(raw))
+            if isinstance(payload, list) and payload:
+                nonempty += 1
+        except Exception:
+            continue
+    return nonempty / max(1, len(plan_json_tail))
+
+
+def _supervisor_collapse_diagnostics(
+    sup_rewards_tail: List[float],
+    sup_parse_tail: List[int],
+    sup_action_sig_tail: List[str],
+    sup_plan_json_tail: List[str],
+) -> Dict[str, Any]:
+    """Identify true supervisor collapse vs healthy low-variance plateaus."""
+    if len(sup_rewards_tail) < 48:
+        return {"should_raise": False, "reason": "insufficient_window"}
+
+    reward_std = _list_std([float(x) for x in sup_rewards_tail])
+    parse_rate = (
+        sum(int(bool(x)) for x in sup_parse_tail) / max(1, len(sup_parse_tail))
+        if sup_parse_tail
+        else 0.0
+    )
+    sigs = [str(s) for s in sup_action_sig_tail if str(s)]
+    action_div = len(set(sigs)) / max(1, len(sigs)) if sigs else 0.0
+    nonempty_plan_ratio = _plan_json_nonempty_ratio([str(x) for x in sup_plan_json_tail])
+
+    # Raise only on true collapse signature:
+    #  - effectively zero reward variance
+    #  - near-zero parse success
+    #  - near-zero action diversity
+    #  - mostly empty merged plans (bad metadata plumbing)
+    should_raise = (
+        reward_std <= 1e-12
+        and parse_rate <= 0.05
+        and action_div <= 0.03
+        and nonempty_plan_ratio <= 0.10
+    )
+    return {
+        "should_raise": bool(should_raise),
+        "reward_std": round(float(reward_std), 12),
+        "parse_rate": round(float(parse_rate), 4),
+        "action_diversity": round(float(action_div), 4),
+        "nonempty_plan_ratio": round(float(nonempty_plan_ratio), 4),
+    }
 
 
 def _dump_grpo_checkpoint_bundle(
