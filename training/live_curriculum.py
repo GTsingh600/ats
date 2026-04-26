@@ -47,7 +47,7 @@ from training.dataset import (
     conflict_proxy_from_solver,
 )
 from training.adapt_curriculum import build_dual_adapt_samples
-from training.roster_integrity import ROSTER_PACK_SIZE
+from training.roster_integrity import ROSTER_PACK_SIZE, get_roster_pack_size
 from domains import get_all_domain_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
@@ -368,8 +368,8 @@ def iter_live_grounded_rows(
 
 
 def live_max_steps(n_episodes: int, batch_size: int, grad_accum: int, passes: float = 2.5) -> int:
-    """Approximate steps to cover ``passes`` virtual epochs over full roster rows per episode."""
-    rows_per_ep = ROSTER_PACK_SIZE
+    """Approximate steps to cover ``passes`` virtual epochs over roster rows per episode (pack size from mode)."""
+    rows_per_ep = max(1, int(get_roster_pack_size()))
     total_rows = max(1, int(n_episodes * rows_per_ep * passes))
     eff_bs = max(1, int(batch_size) * max(1, int(grad_accum)))
     return max(64, (total_rows + eff_bs - 1) // eff_bs)

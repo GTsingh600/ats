@@ -17,7 +17,7 @@ from typing import Any, Dict
 from models import TaskDefinition
 
 # Registered domain modules — add new domains here
-_DOMAIN_REGISTRY: list[str] = ["icu"]
+_DOMAIN_REGISTRY: list[str] = ["icu", "synthetic"]
 
 
 def get_all_domain_tasks() -> Dict[str, TaskDefinition]:

@@ -237,8 +237,16 @@ def build_episode_dataset(
     continuous_curriculum_path: Optional[str] = None,
     grounded_balanced_buckets: bool = True,
     require_bucket_balance: bool = True,
+    training_mode: str = "full",
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
+
+    ``training_mode`` (see :mod:`training.training_modes`):
+
+    - ``full`` — default multi-agent roster.
+    - ``hyper_minimal`` — AMAN+DMAN rows only (faster); ATC ``ordered_tasks`` + generator.
+    - ``adapt_multidomain`` — each episode is a domain task only (AMAN+DMAN+ADAPT);
+      incompatible with ``use_grounded_curriculum=True``.
 
     Returns list of training samples, one per agent turn per episode.
     Each episode has: 1 AMAN bid + 1 DMAN bid + optionally 1 negotiation round.
@@ -255,6 +263,19 @@ def build_episode_dataset(
     and ``grounded_level`` appear only for logging.
     """
     import random
+
+    from training.training_modes import TrainingMode, resolve_training_mode
+
+    mode = resolve_training_mode(training_mode)
+    if mode == TrainingMode.ADAPT_MULTIDOMAIN and use_grounded_curriculum:
+        raise ValueError(
+            "training_mode=adapt_multidomain is incompatible with use_grounded_curriculum=True"
+        )
+    if mode == TrainingMode.HYPER_MINIMAL:
+        include_generator = False
+        include_supervisor = False
+        include_adapt = False
+
     rng = random.Random(seed)
     task_list = list(ordered_tasks())
     supervisor = SupervisorAgent()
@@ -284,6 +305,76 @@ def build_episode_dataset(
             d_sequence = balanced_d_sequence(n_episodes, rng)
         else:
             d_sequence = [cc_state.sample_d(rng) for _ in range(n_episodes)]
+
+    if mode == TrainingMode.ADAPT_MULTIDOMAIN:
+        from domains import get_all_domain_tasks
+        from multi_agent.adapt import (
+            _build_adapt_heuristic,
+            apply_adapt_mapping,
+            build_adapt_observation,
+        )
+
+        domain_tasks_md = get_all_domain_tasks()
+        if not domain_tasks_md:
+            raise RuntimeError("adapt_multidomain: no domain tasks registered")
+        task_ids_md = list(domain_tasks_md.keys())
+        samples_md: List[Dict[str, Any]] = []
+        for ep_id in range(n_episodes):
+            tid = rng.choice(task_ids_md)
+            domain_task = domain_tasks_md[tid]
+            profile = supervisor.sample_profile(ep_id)
+            sup_desc = SUPERVISOR_PROFILES[profile]["description"]
+            adapt_obs = build_adapt_observation(domain_task, profile)
+            h_action = _build_adapt_heuristic(adapt_obs, domain_task)
+            mapped = apply_adapt_mapping(domain_task, h_action)
+            aman_obs, dman_obs = env.reset(
+                episode_id=ep_id,
+                supervisor_profile=profile,
+                mutated_task=mapped,
+                randomize=True,
+            )
+            atfm_json = json.dumps(env._state.atfm_deadlines)
+            difficulty_scalar = float(rng.uniform(0.25, 0.95))
+            tm_meta = {
+                "grounded_curriculum": False,
+                "training_mode": mode.value,
+                "domain_source_task_id": tid,
+            }
+            aman_s = _make_aman_sample(
+                ep_id=ep_id,
+                obs=aman_obs,
+                atfm_json=atfm_json,
+                dman_slots_json="[]",
+                sup_desc=sup_desc,
+                profile=profile,
+                round_name="bid",
+                difficulty_scalar=difficulty_scalar,
+            )
+            aman_s.update(tm_meta)
+            dman_s = _make_dman_sample(
+                ep_id=ep_id,
+                obs=dman_obs,
+                atfm_json=atfm_json,
+                aman_slots_json="[]",
+                sup_desc=sup_desc,
+                profile=profile,
+                round_name="bid",
+                difficulty_scalar=difficulty_scalar,
+            )
+            dman_s.update(tm_meta)
+            adapt_row = _make_adapt_sample(
+                ep_id,
+                adapt_obs,
+                domain_task,
+                difficulty_scalar,
+                domain_source_task_id=tid,
+            )
+            adapt_row.update(tm_meta)
+            samples_md.extend([aman_s, dman_s, adapt_row])
+            controller_score = _estimate_controller_score(mapped)
+            generator.update(controller_score)
+            generator.record(tid, [], controller_score)
+        return samples_md
 
     samples: List[Dict[str, Any]] = []
 
@@ -615,8 +706,9 @@ def _make_adapt_sample(
     obs: ADAPTObservation,
     domain_task: TaskDefinition,
     difficulty_scalar: float,
+    domain_source_task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    row: Dict[str, Any] = {
         "prompt": [
             {"role": "system", "content": ADAPT_SYSTEM},
             {"role": "user", "content": obs.to_prompt_text()},
@@ -629,6 +721,9 @@ def _make_adapt_sample(
         "supervisor_profile": obs.supervisor_profile_name.value,
         "difficulty_scalar": float(difficulty_scalar),
     }
+    if domain_source_task_id is not None:
+        row["domain_source_task_id"] = domain_source_task_id
+    return row
 
 
 def _estimate_controller_score(task: TaskDefinition) -> float:

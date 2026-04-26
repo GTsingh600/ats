@@ -88,11 +88,11 @@ from training.continuous_curriculum import (
     save_continuous_state,
 )
 from training.roster_integrity import (
-    ROSTER_PACK_SIZE,
     align_batch_size_to_roster,
     assert_batch_role_counts,
     assert_dataset_has_full_roster,
     format_role_distribution,
+    get_roster_pack_size,
     strict_roster_enabled,
 )
 from training.dataset import (
@@ -739,7 +739,9 @@ def train(
     max_steps: Optional[int] = None,
     mid_eval_every: int = 0,
     mid_eval_episodes: Optional[int] = None,
+    training_mode: str = "full",
 ) -> None:
+    os.environ["ATC_TRAINING_MODE"] = str(training_mode)
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
     from transformers import TrainerCallback
@@ -757,11 +759,12 @@ def train(
         grounded_live=grounded_live_early,
         use_grounded_curriculum=use_grounded_curriculum,
     ):
-        nb = align_batch_size_to_roster(batch_size, ROSTER_PACK_SIZE)
+        _pack = get_roster_pack_size()
+        nb = align_batch_size_to_roster(batch_size, _pack)
         if nb != batch_size:
             print(
                 f"[STRICT_ROSTER] batch_size {batch_size} -> {nb} "
-                f"(multiple of {ROSTER_PACK_SIZE} for full multi-agent batches)"
+                f"(multiple of {_pack} for roster-aligned batches)"
             )
         batch_size = nb
         tuned["batch_size"] = batch_size
@@ -896,6 +899,14 @@ def train(
     computed_max_steps = _live_max_steps(n_episodes, batch_size, grad_accum, passes=_live_passes)
     if _live_passes != 2.5:
         print(f"[INFO] ATC_LIVE_PASSES={_live_passes} (live_max_steps / materialized row budget)")
+    if grounded_live:
+        from training.training_modes import TrainingMode, resolve_training_mode
+
+        if resolve_training_mode() == TrainingMode.ADAPT_MULTIDOMAIN:
+            raise ValueError(
+                "adapt_multidomain is incompatible with live grounded curriculum "
+                "(use --grounded_curriculum off, or training_mode full/hyper_minimal)."
+            )
     if max_steps is not None:
         cap = max(1, int(max_steps))
         derived = int(computed_max_steps)
@@ -934,11 +945,27 @@ def train(
         _row_it = iter_live_grounded_rows(curriculum_manager, int(seed))
         for _ in range(_max_rows):
             _buf.append(next(_row_it))
+
+        if resolve_training_mode() == TrainingMode.HYPER_MINIMAL:
+            live_full_pack = 6
+            if len(_buf) >= live_full_pack:
+                n_pack = len(_buf) // live_full_pack
+                _buf = _buf[: n_pack * live_full_pack]
+                _buf = [
+                    row
+                    for start in range(0, len(_buf), live_full_pack)
+                    for row in _buf[start : start + 2]
+                ]
+                print(
+                    f"[HYPER_MINIMAL] live grounded: kept AMAN+DMAN rows only "
+                    f"({live_full_pack}-row packs → 2), n={len(_buf)}"
+                )
+
         if strict_roster_enabled(
             grounded_live=True,
             use_grounded_curriculum=True,
         ):
-            _trim = len(_buf) % ROSTER_PACK_SIZE
+            _trim = len(_buf) % get_roster_pack_size()
             if _trim:
                 del _buf[-_trim:]
                 print(f"[STRICT_ROSTER] trimmed {_trim} tail rows for pack alignment (n={len(_buf)})")
@@ -975,6 +1002,7 @@ def train(
             use_grounded_curriculum=use_grounded_curriculum,
             curriculum_state_path=curriculum_state_path,
             continuous_curriculum_path=str(continuous_path),
+            training_mode=str(training_mode),
         )
         print(f"    Dataset (pre-split): {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
@@ -1046,7 +1074,7 @@ def train(
             grounded_live=False,
             use_grounded_curriculum=True,
         ):
-            _trim_s = len(dataset_train) % ROSTER_PACK_SIZE
+            _trim_s = len(dataset_train) % get_roster_pack_size()
             if _trim_s:
                 dataset_train = dataset_train[: len(dataset_train) - _trim_s]
                 dataset = Dataset.from_list(dataset_train)
@@ -1266,6 +1294,20 @@ def train(
                     _raw_plans = [_raw_plans]
                 kwargs["merged_plan_json"] = _expand_kw_to_completions(
                     _n, [str(x) for x in _raw_plans], name="merged_plan_json"
+                )
+            if "domain_task_json" in kwargs:
+                _dt = kwargs.get("domain_task_json")
+                if not isinstance(_dt, list):
+                    _dt = [_dt]
+                kwargs["domain_task_json"] = _expand_kw_to_completions(
+                    _n, [str(x) if x is not None else "" for x in _dt], name="domain_task_json"
+                )
+            if "domain_source_task_id" in kwargs:
+                _ds = kwargs.get("domain_source_task_id")
+                if not isinstance(_ds, list):
+                    _ds = [_ds]
+                kwargs["domain_source_task_id"] = _expand_kw_to_completions(
+                    _n, [str(x) if x is not None else "" for x in _ds], name="domain_source_task_id"
                 )
 
             rewards = combined_reward_fn(completions, **kwargs)
@@ -2346,6 +2388,13 @@ def main() -> None:
         help="GRPO only: mid-eval episode count (default 0 = max(50, --eval_episodes)). "
         "Values <50 are raised to 50.",
     )
+    parser.add_argument(
+        "--training_mode",
+        default="full",
+        choices=("full", "hyper_minimal", "adapt_multidomain"),
+        help="Dataset roster: full 6-role packs; hyper_minimal (AMAN+DMAN only, faster); "
+        "adapt_multidomain (domain-only episodes, AMAN+DMAN+ADAPT, 3-role packs).",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -2393,6 +2442,7 @@ def main() -> None:
             max_steps=args.max_steps,
             mid_eval_every=me_every,
             mid_eval_episodes=me_eps,
+            training_mode=str(args.training_mode),
         )
 
 

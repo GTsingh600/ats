@@ -14,6 +14,7 @@ versions may pass completions and metadata in slightly different shapes.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -897,13 +898,19 @@ def _supervisor_completion_breadth(completion: Any) -> float:
 
 
 def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
-    """Reward ADAPT meta-agent for quality of structural domain transfer."""
+    """Multi-domain ADAPT reward (v2): downstream quality + improvement vs heuristic + coverage.
+
+    Uses a fixed env seed for baseline/LLM rollouts so the same domain_task is comparable
+    across training steps.  Blends ``difficulty_scalar`` (when provided) for a small
+    curriculum signal toward denser early training.
+    """
     from multi_agent.adapt import (
         _build_adapt_heuristic,
         apply_adapt_mapping,
         build_adapt_observation,
         parse_adapt_action,
     )
+    from multi_agent.environment import MultiAgentATCEnvironment
     from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
 
     rewards: List[float] = []
@@ -911,15 +918,24 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
 
     domain_task_jsons = kwargs.get("domain_task_json", [None] * n)
     supervisor_profiles = kwargs.get("supervisor_profile", [None] * n)
+    difficulty_scalars = kwargs.get("difficulty_scalar", [0.5] * n)
+    domain_ids = kwargs.get("domain_source_task_id", [""] * n)
 
     if not isinstance(domain_task_jsons, list):
         domain_task_jsons = [domain_task_jsons] * n
     if not isinstance(supervisor_profiles, list):
         supervisor_profiles = [supervisor_profiles] * n
+    if not isinstance(difficulty_scalars, list):
+        difficulty_scalars = [difficulty_scalars] * n
+    if not isinstance(domain_ids, list):
+        domain_ids = [domain_ids] * n
 
     for i, completion in enumerate(completions):
         dtjson = domain_task_jsons[i] if i < len(domain_task_jsons) else None
         profile = supervisor_profiles[i] if i < len(supervisor_profiles) else None
+        d_sca = float(difficulty_scalars[i]) if i < len(difficulty_scalars) else 0.5
+        d_sca = max(0.0, min(1.0, d_sca))
+        dom_tag = str(domain_ids[i]) if i < len(domain_ids) else ""
 
         if not dtjson:
             rewards.append(-0.60)
@@ -947,28 +963,35 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
             rewards.append(-0.40)
             continue
 
-        # Baseline with heuristic ADAPT mapping
+        rollout_seed = 42
         try:
             heuristic_action = _build_adapt_heuristic(adapt_obs, domain_task)
             heuristic_mapped = apply_adapt_mapping(domain_task, heuristic_action)
-            env_base = MultiAgentATCEnvironment(seed=0)
-            aman_obs_b, dman_obs_b = env_base.reset(0, prof_enum, heuristic_mapped)
+            env_base = MultiAgentATCEnvironment(seed=rollout_seed)
+            aman_obs_b, dman_obs_b = env_base.reset(
+                episode_id=0,
+                supervisor_profile=prof_enum,
+                mutated_task=heuristic_mapped,
+            )
             aman_act_b = _build_aman_heuristic(aman_obs_b)
             dman_act_b = _build_dman_heuristic(dman_obs_b, env_base._state.atfm_deadlines)
             env_base.step_bid(aman_act_b, dman_act_b)
-            baseline_composite = env_base.finalize().composite_score
+            baseline_composite = float(env_base.finalize().composite_score)
         except Exception:
             baseline_composite = 0.40
 
-        # LLM ADAPT mapping
         try:
             llm_mapped = apply_adapt_mapping(domain_task, action)
-            env_llm = MultiAgentATCEnvironment(seed=0)
-            aman_obs_l, dman_obs_l = env_llm.reset(0, prof_enum, llm_mapped)
+            env_llm = MultiAgentATCEnvironment(seed=rollout_seed)
+            aman_obs_l, dman_obs_l = env_llm.reset(
+                episode_id=0,
+                supervisor_profile=prof_enum,
+                mutated_task=llm_mapped,
+            )
             aman_act_l = _build_aman_heuristic(aman_obs_l)
             dman_act_l = _build_dman_heuristic(dman_obs_l, env_llm._state.atfm_deadlines)
             env_llm.step_bid(aman_act_l, dman_act_l)
-            downstream = env_llm.finalize().composite_score
+            downstream = float(env_llm.finalize().composite_score)
         except Exception:
             downstream = 0.0
 
@@ -978,14 +1001,19 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
 
         rationale = action.rationale or ""
         has_numbers = bool(re.search(r"\d+\.\d+", rationale))
-        rationale_bonus = 0.05 if (len(rationale) >= 30 and has_numbers) else 0.0
+        rationale_bonus = 0.06 if (len(rationale) >= 28 and has_numbers) else 0.0
 
-        improvement = downstream - baseline_composite
+        imp = math.tanh(3.0 * (downstream - baseline_composite))
+        # Weak domain-length prior: many distinct task_ids in multi-domain training
+        diversity = 0.02 * min(1.0, len(dom_tag) / 24.0) if dom_tag else 0.0
+        curriculum = 0.08 * d_sca
         reward = (
-            0.70 * downstream
-            + 0.15 * max(-1.0, min(1.0, improvement))
-            + 0.10 * coverage
+            0.52 * downstream
+            + 0.24 * imp
+            + 0.14 * coverage
             + rationale_bonus
+            + curriculum
+            + diversity
         )
         reward = max(-1.0, min(1.0, reward))
         _debug_reward_trace(
@@ -993,9 +1021,12 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
             components={
                 "downstream_composite": downstream,
                 "baseline_composite": baseline_composite,
-                "improvement": improvement,
+                "tanh_improvement": imp,
                 "coverage": coverage,
                 "rationale_bonus": rationale_bonus,
+                "curriculum_blend": curriculum,
+                "domain_tag_len_bonus": diversity,
+                "domain_id": float(len(dom_tag)),
                 "total_reward": reward,
             },
         )
