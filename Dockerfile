@@ -14,14 +14,13 @@ ENV PYTHONUTF8=1
 ENV PYTHONIOENCODING=UTF-8
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential curl \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md openenv.yaml /app/
 COPY uv.lock /app/
 COPY __init__.py client.py constants.py engine.py graders.py imports.py inference.py models.py planner.py tasks.py /app/
 COPY server /app/server
-COPY scripts /app/scripts
 
 RUN pip install --no-cache-dir uv \
     && uv sync --frozen --no-dev

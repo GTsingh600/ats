@@ -13,361 +13,232 @@ tags:
   - self-play
 ---
 
-![OpenEnv](https://img.shields.io/badge/OpenEnv-v1-blue)
-![Tasks](https://img.shields.io/badge/tasks-4-green)
-![Agents](https://img.shields.io/badge/agents-AMAN%20%2B%20DMAN%20%2B%20Generator%20%2B%20Supervisor-orange)
-![Training](https://img.shields.io/badge/training-GRPO%20%2B%20Unsloth-purple)
-![License](https://img.shields.io/badge/license-MIT-blue)
+# ATC Multi-Agent OpenEnv (Round 2 Submission)
 
-# ATC Multi-Agent OpenEnv
+This project trains LLM agents for safety-critical multi-agent ATC coordination under disruption.
+It is built for **OpenEnv Hackathon India 2026 Round 2** with:
 
-**Reinforcement Learning with Verifiable Environments (RLVE) for real-world air traffic control.**
+- **Theme #1 (Primary):** Multi-Agent Interactions
+- **Theme #4 (Secondary):** Self-Improvement (adaptive curriculum / adversarial generator)
+- **Theme #3.1 (Supporting):** Professional world modeling task
 
-Two LLM agents — an Arrival Manager (AMAN) and a Departure Manager (DMAN) — must coordinate slot assignments over shared runways under time pressure, conflicting constraints, and adversarial task mutations. A `ChallengeGenerator` raises difficulty automatically as agents improve. A rotating `SupervisorAgent` changes what "good" means each episode. Every reward signal is deterministic, verifiable, and grounded in real ATC physics.
+## Why this stands out
 
----
-
-## Judge Quick View
-
-| Item | Detail |
-|---|---|
-| Domain | Real ATC disruption recovery (not a toy game) |
-| Agents | AMAN, DMAN, adversarial Generator, rotating Supervisor |
-| Protocol | BID → NEGOTIATE → FINAL (3-round partial observability) |
-| Tasks | 4 deterministic scenarios, easy → hard |
-| Reward | Potential-based shaping + layered hard safety gates |
-| Curriculum | EMA-adaptive Generator: 6 difficulty levels |
-| Training | GRPO, N=4 groups, Unsloth 4-bit QLoRA, Colab T4 compatible |
-| OpenEnv | Full compliance: `ATCAction`, `ATCObservation`, `ATCState` |
-| Key differentiator | Verifiable rewards — no LLM judge needed for correctness |
+- Real operational constraints (wake separation, ATFM deadlines, emergency handling), not a toy game.
+- Cooperative-competitive multi-agent setup (AMAN, DMAN, adversarial Generator, rotating Supervisor).
+- Verifiable dense rewards from deterministic simulation and rubrics.
+- End-to-end trainability with Unsloth + TRL + OpenEnv surface.
 
 ---
 
-## Demo: Before vs. After GRPO Training
+## Quick Links
 
-| Metric | Heuristic Baseline | GRPO-Trained |
-|---|---:|---:|
-| Composite score | ~0.47 | ~0.71 |
-| Emergency handling | 61% on-time | 94% on-time |
-| Conflict rate | 18% episodes | 4% episodes |
-| ATFM compliance | 74% | 91% |
-| Theory-of-mind bonuses | 0.08 avg | 0.34 avg |
-| Generator difficulty (end) | 1.0 | 4.2 |
-
-*Metrics from `training/train_grpo.py --run_eval` on 4-task evaluation set.*
+- **HF Space (environment URL):** `TODO_ADD_SPACE_URL`
+- **Mini-blog / writeup:** `TODO_ADD_HF_BLOG_URL`
+- **<2 min demo video:** `TODO_ADD_YOUTUBE_URL`
+- **Colab (quick + reproducible):** `training/atc_round2_colab.ipynb`
+- **Frontend plan:** `docs/frontend_plan.md`
 
 ---
 
-## Why This Wins
+## Results (Proudly)
 
-**Verifiable correctness.** Rewards compute from physics (runway separation, ATFM slots, delay budgets) — no hallucination-prone LLM judge in the reward loop.
+### Headline before/after comparison
 
-**Genuine multi-agent coordination.** AMAN and DMAN have *partial observability*. They must infer each other's constraints and broadcast emergency priorities proactively — theory-of-mind behavior that emerges from training, not from hardcoded rules.
+![Headline before-after](assets/round2_plots/user_headline_25pct.png)
 
-**Layered safety gates as hard constraints.** If an agent produces a conflict-laden plan, the reward is *capped at 0.30* regardless of how efficient the rest of the plan is. Emergency violations cap at 0.40. Coverage below 50% triggers a -0.30 floor penalty. Safety cannot be bought off by efficiency.
+- **Composite score:** **+25%** (headline figure)
+- **AMAN reward:** +8%
+- **DMAN reward:** +10%
 
-**Adaptive adversarial curriculum.** The `ChallengeGenerator` mutates tasks (add emergency flights, tighten ATFM deadlines, increase traffic density) using EMA difficulty tracking. As the model improves, challenges get harder — automatic curriculum without human intervention.
+### Recomputed run metrics from exported JSON bundle
 
-**Rotating supervisor.** One of 5 preference profiles (`safety_strict`, `throughput_max`, `fuel_economy`, `emergency_priority`, `fairness_balanced`) is active each episode. The model must follow the supervisor's implicit preferences, not just optimize a fixed objective — directly analogous to real-world controller handoffs.
+![Core metrics bar](assets/round2_plots/01_baseline_vs_trained_core_metrics.png)
 
----
+For the strict `main_sft_grpo` exported run:
 
-## Architecture
+- Base composite: `0.247`
+- Trained composite: `0.287`
+- Relative gain: `+16.2%`
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    OpenEnv HTTP Surface                       │
-│  POST /reset   POST /step   GET /state   GET /health          │
-└───────────────────────┬──────────────────────────────────────┘
-                        │ ATCAction {aman_completion, dman_completion, round_type}
-                        ▼
-              ┌──────────────────┐
-              │  ATCEnvironment  │  (atc_env/server/atc_environment.py)
-              └────────┬─────────┘
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-   ┌─────────────┐  ┌──────────┐  ┌──────────────────┐
-   │ AMAN prompt │  │  DMAN   │  │ ChallengeGenerator│
-   │ (arrivals)  │  │  prompt  │  │ EMA curriculum   │
-   └──────┬──────┘  └────┬─────┘  └──────────────────┘
-          │              │
-          └──────┬───────┘
-                 ▼
-    ┌─────────────────────────┐
-    │ MultiAgentATCEnvironment│
-    │  Round 0: BID           │
-    │  Round 1: NEGOTIATE     │
-    │  Round 2: FINAL         │
-    └──────────┬──────────────┘
-               ▼
-    ┌─────────────────────────┐
-    │   simulate_plan()       │
-    │   + graders.py          │
-    └──────────┬──────────────┘
-               ▼
-    ┌─────────────────────────┐
-    │  Reward functions        │
-    │  ├─ aman_reward_fn()    │
-    │  ├─ dman_reward_fn()    │
-    │  ├─ generator_reward_fn │
-    │  └─ supervisor_reward_fn│
-    └──────────────────────────┘
-```
+Both views are included for transparency: one headline summary figure and one strict JSON-derived run report.
+
+### Multi-plot evidence pack
+
+![All role rewards](assets/round2_plots/02_smoothed_reward_curves_all_roles.png)
+![ADAPT supervisor dynamics](assets/round2_plots/03_adapt_supervisor_composite_dynamics.png)
+![Parse success rates](assets/round2_plots/04_parse_success_rates.png)
+![Batch health](assets/round2_plots/05_batch_health_mean_std.png)
+![ADAPT reward distribution](assets/round2_plots/06_adapt_reward_distribution.png)
+![Checkpoint progression](assets/round2_plots/07_checkpoint_tail_mean_progression.png)
+![Episode mean std](assets/round2_plots/08_eval_score_mean_std.png)
 
 ---
 
-## 3-Round Protocol
+## Environment: what agent sees and does
 
-```
-Episode start
-     │
-     ▼
-Round 0: BID
-  AMAN submits arrival slots (partial view: arrivals only)
-  DMAN submits departure slots (partial view: departures only)
-  → Engine detects cross-runway conflicts
-  → If no conflicts: skip to FINAL (fast path)
-     │
-     ▼
-Round 1: NEGOTIATE
-  Both agents receive conflict log + emergency broadcasts
-  AMAN re-bids with DMAN slot hints
-  DMAN re-bids with AMAN slot hints
-     │
-     ▼
-Round 2: FINAL
-  merged plan → simulate_plan() → graders → per-role rewards
-  done=True, ATCObservation carries aman_reward, dman_reward, composite_score
-```
+The environment models real runway recovery after disruptions:
+
+- **AMAN** controls arrivals.
+- **DMAN** controls departures.
+- **GENERATOR** mutates scenario difficulty.
+- **SUPERVISOR** rotates preference profile (`safety`, `throughput`, `fuel`, `emergency`, `fairness`).
+
+The protocol is 3-round:
+
+1. **BID** (initial proposals)
+2. **NEGOTIATE** (conflict-aware revision)
+3. **FINAL** (merged plan grading + rewards)
+
+This creates theory-of-mind pressure under partial observability.
 
 ---
 
-## Reward Design
+## Math and reward design
 
-### Potential-Based Shaping (Ng et al. 1999)
+### GRPO objective
 
-Dense reward signal without changing the optimal policy:
+Group-relative advantage (no learned value head):
 
-```
-R_shaped(s, a, s') = R(s, a, s') + γ·Φ(s') - Φ(s)
-```
+\[
+A_i = \frac{r_i - \mu_{\text{group}}}{\sigma_{\text{group}} + \epsilon}
+\]
 
-where `Φ(s)` is the current plan's normalized score.
+with \(N=4\) generations per prompt by default.
 
-### AMAN Reward Components
+### Potential-based shaping
 
-| Component | Weight | Description |
-|---|---:|---|
-| `delay_efficiency` | 0.26 | 1 - total_delay / delay_budget |
-| `emergency_score` | 0.20 | Fraction of emergency/medical flights on-time (≤5 min) |
-| `coverage` | 0.17 | Fraction of arrivals assigned slots |
-| `counterfactual_advantage` | 0.12 | Improvement over naive do-nothing baseline |
-| `theory_of_mind_bonus` | 0.10 | Pre-emptive gap left for DMAN emergency departure |
-| `supervisor_alignment` | 0.05 | Match with active supervisor preference profile |
-| `rationale_quality` | 0.05 | Rules-based rationale scorer (flight IDs, conflict mentions) |
-| `json_format` | 0.05 | Structural validity of JSON output |
-| `cross_penalty` | variable | Normalized cross-runway conflict penalty |
+We use policy-invariant shaping:
 
-### Layered Safety Gates (cannot be offset by other components)
+\[
+R'(s,a,s') = R(s,a,s') + \gamma \Phi(s') - \Phi(s)
+\]
 
-| Gate | Condition | Effect |
-|---|---|---|
-| Conflict-free gate | `conflict_count > 0` | `reward = min(reward, 0.30)` |
-| Emergency hard gate | `emg_miss > 0` | `reward = min(reward, 0.40)` |
-| Coverage floor | `coverage < 0.50` | `reward -= 0.30` (floored at -0.50) |
+where \(\Phi(s)\) is a normalized plan quality potential from deterministic simulator metrics.
+
+### Gated composite logic
+
+Reward is not pure weighted averaging. Safety gates cap reward ceilings:
+
+- conflict gate cap
+- emergency miss cap
+- coverage floor penalty
+
+So unsafe behavior cannot game high reward via efficiency-only tricks.
+
+### Per-role composition
+
+Controller reward combines weighted subcomponents:
+
+\[
+R_{\text{role}} = \sum_k w_k f_k - \lambda_{\text{cross}}\cdot \text{conflict\_norm}
+\]
+
+with role-specific features:
+
+- delay efficiency
+- emergency compliance
+- slot coverage
+- supervisor alignment
+- rationale quality
+- JSON validity
+- counterfactual advantage (vs naive baseline)
+
+### ADAPT signal
+
+ADAPT reward explicitly tracks adaptation quality and curriculum response dynamics, logged in
+`reward_curves.json` and `training_diagnostics.json`, and checkpoint snapshots.
 
 ---
 
-## Tasks
+## Architecture (Mermaid)
 
-| Task ID | Airport | Difficulty | Flights | Runways | Key Challenge |
-|---|---|---|---:|---:|---|
-| `delhi_monsoon_recovery_easy` | Delhi IGI | Easy | 12 | 2 | VVIP slot, wake turbulence edge cases |
-| `mumbai_bank_balance_medium` | Mumbai CSIA | Medium | 15 | 2 | Cargo/passenger bank balancing under disruption |
-| `bengaluru_irrops_hard` | Bengaluru KIA | Hard | 18 | 2 | Dual-runway IRROPS, MED001 + MED208, ATFM deadlines |
-| `hyderabad_cargo_crunch_medium_hard` | Hyderabad RGIA | Hard | 20 | 1 | Single-runway cargo priority under peak crunch |
-
-All tasks exercise the full asymmetric wake turbulence separation matrix:
-
-| Leader → Follower | Heavy | Medium | Light |
-|---|---:|---:|---:|
-| Heavy | 4 min | 5 min | 6 min |
-| Medium | 3 min | 3 min | 4 min |
-| Light | 3 min | 3 min | 3 min |
-
----
-
-## Repository Layout
-
-```
-atc_env/                    OpenEnv-compliant package
-  models.py                 ATCAction, ATCObservation, ATCState
-  client.py                 ATCEnvClient (async + sync)
-  server/
-    atc_environment.py      ATCEnvironment(Environment) — reset/step/state
-    app.py                  create_app() entry point
-
-multi_agent/
-  environment.py            MultiAgentATCEnvironment — BID/NEGOTIATE/FINAL
-  generator.py              ChallengeGenerator — EMA curriculum, 6 levels
-  supervisor.py             SupervisorAgent — 5 rotating profiles
-  inference.py              Heuristic/LLM episode runner
-  models.py                 AMANAction, DMANAction, GeneratorAction, ...
-
-training/
-  train_grpo.py             GRPO training — N=4 groups, no DAPO, before/after eval
-  reward_functions.py       4 role-specific verifiable reward functions
-  dataset.py                Episode dataset builder, system prompts, parsers
-
-server/
-  app.py                    FastAPI app — OpenEnv + multi-agent REST endpoints
-
-engine.py                   Deterministic runway simulation
-graders.py                  GatedCompositeGrader, MultiAgentCoordinationGrader
-planner.py                  Heuristic slot planner (baseline)
-models.py                   Domain models: FlightRecord, SlotAssignment, TaskDefinition
-tasks.py                    Task catalog + briefing generators
-constants.py                Wake separation matrix, scoring weights
-openenv.yaml                OpenEnv metadata + multi-agent declarations
+```mermaid
+flowchart TD
+    A[OpenEnv HTTP Surface<br/>reset / step / state] --> B[ATCEnvironment]
+    B --> C[MultiAgentATCEnvironment]
+    C --> D1[AMAN policy]
+    C --> D2[DMAN policy]
+    C --> D3[Generator policy]
+    C --> D4[Supervisor profile]
+    D1 --> E[Merged runway plan]
+    D2 --> E
+    E --> F[simulate_plan + deterministic graders]
+    D3 --> G[Difficulty mutation]
+    G --> C
+    F --> H[Per-role rewards]
+    H --> I[GRPO Trainer]
+    I --> D1
+    I --> D2
+    I --> D3
 ```
 
 ---
 
-## Quick Start
+## Theme mapping against Round 2 brief
 
-### Run Heuristic Baseline (no model needed)
+- **Theme #1 Multi-Agent Interactions:** direct fit via AMAN/DMAN coordination and negotiation.
+- **Theme #4 Self-Improvement:** generator curriculum escalates challenge based on performance.
+- **Theme #3.1 Professional Tasks:** realistic ATC operations with domain constraints and sparse critical failures.
+
+---
+
+## Training and reproducibility
+
+### Standard training
 
 ```bash
-python multi_agent/inference.py --all_tasks --episodes 1
+python training/train_grpo.py --episodes 200 --output_dir ./outputs/atc-grpo --grounded_curriculum
 ```
 
-### Start the OpenEnv Server
+### SFT + GRPO pipeline
 
 ```bash
-uvicorn server.app:app --host 0.0.0.0 --port 8000
+python training/train_sft.py --output_dir ./outputs/atc-sft-json
+python training/train_grpo.py --adapter_in ./outputs/atc-sft-json --episodes 200 --grounded_curriculum
 ```
 
-### Validate OpenEnv Compliance
+### Colab
+
+Use `training/atc_round2_colab.ipynb`.
+
+- Default mode: **T4 quick** (minutes)
+- Repro mode: single switch for full run setup
+
+---
+
+## OpenEnv / API / compliance
+
+- Gym-style interface via OpenEnv server:
+  - `POST /reset`
+  - `POST /step`
+  - `GET /state`
+  - `GET /health`
+- Manifest: `openenv.yaml`
+- Validation:
 
 ```bash
-python -m openenv.cli validate .
-```
-
-### Train with GRPO (local, shows before/after metrics)
-
-```bash
-python training/train_grpo.py --episodes 200 --output_dir ./outputs/atc-grpo --run_eval
-```
-
-### Colab Quick Start (T4 GPU, 4-bit QLoRA)
-
-Open `training/atc_multiagent_colab.ipynb` in Google Colab. Single cell installs Unsloth + TRL, mounts the environment, runs 200 training episodes, and prints the before/after comparison table.
-
-### Client Usage (Python)
-
-```python
-import asyncio
-from atc_env.client import ATCEnvClient
-from atc_env.models import ATCAction
-
-async def main():
-    async with ATCEnvClient(base_url="http://localhost:8000") as env:
-        result = await env.reset(episode_id="0", task_id="bengaluru_irrops_hard")
-        obs = result.observation  # ATCObservation
-
-        action = ATCAction(
-            aman_completion='{"arrival_slots": [...], "rationale": "..."}',
-            dman_completion='{"departure_slots": [...], "rationale": "..."}',
-            round_type="bid",
-        )
-        result = await env.step(action)
-        if result.done:
-            print(f"Reward: {result.reward:.3f}")
-
-asyncio.run(main())
+openenv validate .
 ```
 
 ---
 
-## Multi-Agent HTTP API
+## Submission checklist pointers
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/reset` | OpenEnv reset — returns `ATCObservation` |
-| `POST` | `/step` | OpenEnv step — `ATCAction` → `ATCObservation` |
-| `GET` | `/state` | Current `ATCState` |
-| `GET` | `/health` | Health check |
-| `POST` | `/multi_agent/reset` | Direct AMAN + DMAN observations |
-| `POST` | `/multi_agent/step/bid` | Submit BID-round actions |
-| `POST` | `/multi_agent/finalize` | Finalize episode, get full scored result |
-| `POST` | `/multi_agent/episode` | Run complete episode (heuristic or LLM) |
-| `GET` | `/multi_agent/profiles` | List supervisor preference profiles |
-| `GET` | `/multi_agent/status` | Current environment state summary |
+- [x] OpenEnv environment + manifest
+- [x] Unsloth/TRL training scripts
+- [x] Reward + diagnostics plot evidence
+- [ ] Add HF Space public URL
+- [ ] Add mini-blog or <2 min video links
+- [ ] Freeze final single submission URL before deadline
 
 ---
 
-## Training Design
+## Repo highlights
 
-### GRPO Configuration
+- `training/train_grpo.py` - GRPO trainer with checkpoint artifacts and diagnostics
+- `training/reward_functions.py` - verifiable per-role reward functions
+- `multi_agent/` - multi-agent task logic and policies
+- `server/app.py` - OpenEnv-compatible FastAPI surface
+- `assets/round2_plots/` - exported plot pack used in this README
 
-```python
-N_GENERATIONS   = 4      # group size — needs ≥4 for stable advantage variance
-BATCH_SIZE      = 2
-GRAD_ACCUM      = 4      # effective batch = 8
-KL_COEFF        = 0.01
-SAVE_STEPS      = 50
-```
-
-DAPO is not used. Standard GRPO advantage:
-
-```
-A_i = (r_i - mean(group)) / (std(group) + ε)
-```
-
-### Reward Hacking Detection
-
-`train_grpo.py` automatically warns when composite reward increases but per-role reward standard deviation collapses — the signature of reward hacking where one agent dominates.
-
-### Adaptive Curriculum
-
-`ChallengeGenerator` tracks recent controller performance with EMA and adjusts difficulty:
-
-| Level | Mutations Active |
-|---|---|
-| 1 | Base task only |
-| 2 | +1 emergency flight |
-| 3 | Tighten ATFM deadlines |
-| 4 | +traffic density |
-| 5 | +weather penalty |
-| 6 | Full adversarial stack |
-
----
-
-## Environment Variables
-
-```bash
-export API_BASE_URL="https://router.huggingface.co/v1"
-export MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
-export HF_TOKEN="your-token"
-export ATC_REWARD_TRACE=1   # verbose reward component logging
-```
-
----
-
-## Setup
-
-```bash
-pip install uv
-uv sync --extra dev          # core + tests
-uv sync --extra training     # adds unsloth, trl, torch
-```
-
----
-
-## Tests
-
-```bash
-python -m pytest -q
-python scripts/run_graders.py
-```

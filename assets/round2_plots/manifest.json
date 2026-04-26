@@ -1,0 +1,19 @@
+{
+  "source_workspace": "/home/keshav/Downloads/submission_workspace_20260426_020303",
+  "plots_dir": "/home/keshav/ats/assets/round2_plots",
+  "plots": [
+    "01_baseline_vs_trained_core_metrics.png",
+    "02_smoothed_reward_curves_all_roles.png",
+    "03_adapt_supervisor_composite_dynamics.png",
+    "04_parse_success_rates.png",
+    "05_batch_health_mean_std.png",
+    "06_adapt_reward_distribution.png",
+    "07_checkpoint_tail_mean_progression.png",
+    "08_eval_score_mean_std.png"
+  ],
+  "headline": {
+    "base_composite": 0.247,
+    "trained_composite": 0.287,
+    "composite_improvement_pct": 16.2
+  }
+}
