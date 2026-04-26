@@ -327,14 +327,16 @@ def build_episode_dataset(
             adapt_obs = build_adapt_observation(domain_task, profile)
             h_action = _build_adapt_heuristic(adapt_obs, domain_task)
             mapped = apply_adapt_mapping(domain_task, h_action)
+            # Fixed difficulty + no parametric randomize: stable downstream scores so
+            # GRPO sees variance from completions (not env noise); curriculum blend off (d=0).
             aman_obs, dman_obs = env.reset(
                 episode_id=ep_id,
                 supervisor_profile=profile,
                 mutated_task=mapped,
-                randomize=True,
+                randomize=False,
             )
             atfm_json = json.dumps(env._state.atfm_deadlines)
-            difficulty_scalar = float(rng.uniform(0.25, 0.95))
+            difficulty_scalar = 0.0
             tm_meta = {
                 "grounded_curriculum": False,
                 "training_mode": mode.value,

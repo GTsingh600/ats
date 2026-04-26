@@ -901,9 +901,12 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
     """Multi-domain ADAPT reward (v2): downstream quality + improvement vs heuristic + coverage.
 
     Uses a fixed env seed for baseline/LLM rollouts so the same domain_task is comparable
-    across training steps.  Blends ``difficulty_scalar`` (when provided) for a small
-    curriculum signal toward denser early training.
+    across training steps.  For ``adapt_multidomain`` builds, ``difficulty_scalar`` is fixed
+    at 0 (no adaptive curriculum blend); reward weights emphasize relative improvement so
+    GRPO groups are less likely to tie-flat when the model copies the heuristic.
     """
+    from training.training_modes import TrainingMode, resolve_training_mode
+
     from multi_agent.adapt import (
         _build_adapt_heuristic,
         apply_adapt_mapping,
@@ -930,11 +933,15 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
     if not isinstance(domain_ids, list):
         domain_ids = [domain_ids] * n
 
+    _multidomain = resolve_training_mode() == TrainingMode.ADAPT_MULTIDOMAIN
+
     for i, completion in enumerate(completions):
         dtjson = domain_task_jsons[i] if i < len(domain_task_jsons) else None
         profile = supervisor_profiles[i] if i < len(supervisor_profiles) else None
         d_sca = float(difficulty_scalars[i]) if i < len(difficulty_scalars) else 0.5
         d_sca = max(0.0, min(1.0, d_sca))
+        if _multidomain:
+            d_sca = 0.0
         dom_tag = str(domain_ids[i]) if i < len(domain_ids) else ""
 
         if not dtjson:
@@ -1006,14 +1013,22 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
         imp = math.tanh(3.0 * (downstream - baseline_composite))
         # Weak domain-length prior: many distinct task_ids in multi-domain training
         diversity = 0.02 * min(1.0, len(dom_tag) / 24.0) if dom_tag else 0.0
-        curriculum = 0.08 * d_sca
+        curriculum = 0.0 if _multidomain else (0.08 * d_sca)
+        text = _coerce_completion_text(completion)
+        # Small completion-dependent spread (deterministic) so GRPO groups rarely share one score.
+        len_shape = 0.05 * min(1.0, len(text) / 480.0) if _multidomain else 0.0
+        if _multidomain:
+            w_down, w_imp, w_cov = 0.46, 0.36, 0.17
+        else:
+            w_down, w_imp, w_cov = 0.52, 0.24, 0.14
         reward = (
-            0.52 * downstream
-            + 0.24 * imp
-            + 0.14 * coverage
+            w_down * downstream
+            + w_imp * imp
+            + w_cov * coverage
             + rationale_bonus
             + curriculum
             + diversity
+            + len_shape
         )
         reward = max(-1.0, min(1.0, reward))
         _debug_reward_trace(
@@ -1026,6 +1041,7 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
                 "rationale_bonus": rationale_bonus,
                 "curriculum_blend": curriculum,
                 "domain_tag_len_bonus": diversity,
+                "completion_len_shape": len_shape if _multidomain else 0.0,
                 "domain_id": float(len(dom_tag)),
                 "total_reward": reward,
             },

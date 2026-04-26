@@ -627,6 +627,33 @@ def test_dataset_no_adapt_when_disabled():
     assert len(adapt_samples) == 0
 
 
+def test_adapt_multidomain_rows_have_zero_difficulty_scalar():
+    """Easier ADAPT path: no adaptive d blend; stable env (see training_modes / dataset)."""
+    import os
+
+    from training.dataset import build_episode_dataset
+
+    prev = os.environ.get("ATC_TRAINING_MODE")
+    try:
+        os.environ["ATC_TRAINING_MODE"] = "adapt_multidomain"
+        samples = build_episode_dataset(
+            n_episodes=12,
+            seed=0,
+            training_mode="adapt_multidomain",
+            use_grounded_curriculum=False,
+        )
+    finally:
+        if prev is None:
+            os.environ.pop("ATC_TRAINING_MODE", None)
+        else:
+            os.environ["ATC_TRAINING_MODE"] = prev
+
+    assert len(samples) == 12 * 3
+    for r in samples:
+        assert r.get("difficulty_scalar") == 0.0
+        assert r.get("training_mode") == "adapt_multidomain"
+
+
 # ── Generic domain registry ───────────────────────────────────────────────────
 
 def test_get_all_domain_tasks_returns_icu_tasks():

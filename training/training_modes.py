@@ -5,7 +5,9 @@ Modes are selected via ``--training_mode`` / ``ATC_TRAINING_MODE``:
 - ``full`` — default: AMAN, DMAN, GENERATOR, SUPERVISOR, ADAPT (6-row packs).
 - ``hyper_minimal`` — AMAN + DMAN only (2-row packs, faster, ATC catalog + generator mutations).
 - ``adapt_multidomain`` — AMAN + DMAN + ADAPT on **domain tasks only** (3-row packs), ≥10 domain
-  worlds via ``domains`` registry (ICU + synthetic pack).
+  worlds via ``domains`` registry (ICU + synthetic pack).  Dataset uses ``difficulty_scalar=0`` and
+  ``randomize=False`` on env reset; ADAPT reward skips adaptive curriculum blend and biases
+  improvement vs heuristic so GRPO sees less tie-flat variance.
 """
 
 from __future__ import annotations
